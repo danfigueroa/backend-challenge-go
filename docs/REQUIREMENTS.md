@@ -36,12 +36,12 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 
 | # | Requisito | Implementação | Evidência | Status |
 |---|---|---|---|---|
-| S1 | Versão Go declarada em `go.mod` e Dockerfile | `go.mod` (`go 1.27.1`) | | 🚧 |
-| S2 | `go.mod`/`go.sum` versionados | `go.mod` | | 🚧 |
-| S3 | Uber Fx com `fx.Module`/`fx.Provide`/`fx.Invoke` | | | ⏳ |
-| S4 | `fx.Lifecycle`: validação no start, workers canceláveis, shutdown ordenado | | | ⏳ |
-| S5 | Domínio independente de Fx/HTTP/SQS/persistência | `internal/domain` (depende só da stdlib e `google/uuid`) | `go list -deps ./internal/domain/...` | 🚧 |
-| S6 | Migrations versionadas com up/down documentados | `migrations/`, `postgres.Migrator` | `TestMigrationsApplyRevertAndReapply` | 🚧 |
+| S1 | Versão Go declarada em `go.mod` e Dockerfile | `go.mod` (`go 1.27.1`), `Dockerfile` (`golang:1.27.1-alpine3.24`) | `docker build` | ✅ |
+| S2 | `go.mod`/`go.sum` versionados | `go.mod`, `go.sum` | `go mod verify` | ✅ |
+| S3 | Uber Fx com `fx.Module`/`fx.Provide`/`fx.Invoke` | `internal/fxapp` | `TestApplicationGraphIsValidForEveryRoleCombination` | ✅ |
+| S4 | `fx.Lifecycle`: validação no start, workers canceláveis, shutdown ordenado | `internal/fxapp`, `internal/worker`, `internal/platform/httpserver` | `TestApplicationStartsServesAndStopsCleanly`, `TestRunner*`, `TestServerLifecycleCompletesInFlightRequests` | 🚧 |
+| S5 | Domínio independente de Fx/HTTP/SQS/persistência | `internal/domain` (depende só da stdlib e `google/uuid`) | `go list -deps ./internal/domain/...` | ✅ |
+| S6 | Migrations versionadas com up/down documentados | `migrations/`, `wallet migrate up|down|version`, README | `TestMigrationsApplyRevertAndReapply` | ✅ |
 | S7 | Docker Compose | | | ⏳ |
 
 ## Domínio (§6, §7)
@@ -77,7 +77,7 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | H9 | Conflitos de chave e de `(providerId, externalTransactionId)` | `IdempotencyConflictError` | `TestIdempotencyConflicts` | 🚧 |
 | H10 | Códigos HTTP distinguíveis documentados | | | ⏳ |
 | H11 | `POST /wallets/:id/reconciliation` | Caso de uso `Reconcile` (snapshot read-only) | `TestReconciliation*`, `TestBuildReport` | 🚧 |
-| H12 | `/health/live` e `/health/ready` | | | ⏳ |
+| H12 | `/health/live` e `/health/ready` | `internal/platform/health` (admin; API pública na Fase 5; SQS na Fase 6) | `health_test.go`, `TestApplicationStartsServesAndStopsCleanly` | 🚧 |
 | A1 | IdP OIDC externo (Keycloak) provisionado automaticamente | | | ⏳ |
 | A2 | `providerId` determinado pela identidade | | | ⏳ |
 | A3 | Isolamento entre provedores (consultas e replays) | `app.Actor` nos casos de uso | `TestProviderIsolation` | 🚧 |
@@ -103,9 +103,9 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 
 | # | Requisito | Implementação | Evidência | Status |
 |---|---|---|---|---|
-| O1 | Logs JSON com identificadores de rastreio, sem dados sensíveis | | | ⏳ |
-| O2 | Métricas: status, duplicatas, retries, DLQ, conflitos, atraso outbox, latência, divergências | | | ⏳ |
-| O3 | Tracing OpenTelemetry (opcional) | | | ⏳ |
+| O1 | Logs JSON com identificadores de rastreio, sem dados sensíveis | `internal/platform/logging` | `logging_test.go` | ✅ |
+| O2 | Métricas: status, duplicatas, retries, DLQ, conflitos, atraso outbox, latência, divergências | `internal/platform/metrics` (DLQ/publicação instrumentados na Fase 6) | `metrics_test.go` | 🚧 |
+| O3 | Tracing OpenTelemetry (opcional) | `internal/platform/tracing`, `otelpgx` (HTTP/SQS nas Fases 5/6) | `tracing_test.go` | 🚧 |
 | O4 | Dashboard Grafana (opcional) | | | ⏳ |
 
 ## Verificação (§13)
@@ -115,7 +115,7 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | T1 | Unitários de Money, Wallet, estados, cinco tipos, conflito de payload, zero, OPENING | `internal/domain/{money,wallet,wagering,event}` (cobertura 94–99%) | ✅ |
 | T2 | Integração: migrations, constraints, imutabilidade, atomicidade | `migrations_integration_test.go`, `schema_integration_test.go`, `txmanager_integration_test.go` | ✅ |
 | T3 | Integração: inbox, reentrega, outbox concorrente, retry, DLQ, reinício | Repositório: `TestInboxConcurrentDeliveriesInsertOnce`, `TestClaimDuePendingIsExclusiveAcrossWorkers`; SQS na Fase 6 | 🚧 |
-| T4 | Composição Fx: start/stop e liberação de recursos | | ⏳ |
+| T4 | Composição Fx: start/stop e liberação de recursos | `TestApplicationStartsServesAndStopsCleanly` (goleak), `TestApplicationFailsToStartWithoutDatabase` | ✅ |
 | T5 | Auth: credenciais ausentes/inválidas/expiradas; isolamento; sem efeitos | | ⏳ |
 | T6 | Mesma aposta 50× em paralelo → um débito | `TestSameBetFiftyTimesInParallelDebitsOnce` (HTTP/multi-processo na Fase 7) | 🚧 |
 | T7 | Duas apostas de 80.00 sobre 100.00 | `TestTwoConcurrentBetsOfEightyOnHundred`, `TestConcurrentBetsOnSameWalletAtRepositoryLevel` (multi-processo na Fase 7) | 🚧 |
@@ -135,7 +135,7 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 |---|---|---|
 | X1 | `README.md` completo | ⏳ |
 | X2 | `ARCHITECTURE.md` com todas as decisões e limitações | ⏳ |
-| X3 | `.env.example` | ⏳ |
+| X3 | `.env.example` | 🚧 |
 | X4 | `docker compose up --build`, `go test ./...`, `go test -race ./...`, `go vet ./...` | ⏳ |
 | X5 | Instruções de integração, multi-instância e falhas | ⏳ |
 | X6 | Código formatado com `gofmt` | ⏳ |
