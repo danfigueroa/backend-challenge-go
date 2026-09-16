@@ -1,0 +1,11 @@
+.git
+.github
+.idea
+.vscode
+bin
+coverage.*
+docs
+test/load/results
+CLAUDE.md
+.claude
+*.md
