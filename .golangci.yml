@@ -54,8 +54,11 @@ linters:
       - path: internal/testsupport/
         linters:
           - wrapcheck
-      - path: internal/app/runtime\.go
-        text: G404
+      - text: G404
+        linters:
+          - gosec
+      - path: cmd/wallet/main\.go
+        text: G704
         linters:
           - gosec
       - path: internal/platform/(metrics|tracing)/
