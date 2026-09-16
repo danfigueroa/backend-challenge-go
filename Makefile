@@ -1,7 +1,11 @@
 SHELL := /bin/bash
 
+ifeq ($(shell uname -s),Darwin)
+export CGO_ENABLED ?= 0
+endif
+
 GOLANGCI_LINT_VERSION := v2.13.2
-GOLANGCI_LINT := CGO_ENABLED=0 go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+GOLANGCI_LINT := go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
 COMPOSE := docker compose
 MIGRATE := $(COMPOSE) run --rm migrate
