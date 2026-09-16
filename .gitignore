@@ -1,0 +1,25 @@
+# Binaries
+/bin/
+*.exe
+*.test
+*.out
+
+# Coverage and profiling
+coverage.*
+*.pprof
+
+# Environment
+.env
+!.env.example
+
+# Load test results
+/test/load/results/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local AI assistant instructions (never committed)
+CLAUDE.md
+.claude/
