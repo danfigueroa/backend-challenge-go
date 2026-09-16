@@ -77,7 +77,7 @@ func NewRequest(in RequestInput) (Request, error) {
 		return Request{}, err
 	}
 	if in.Kind == "" {
-		return Request{}, newValidationError(CodeMissingField, "kind", "is required")
+		return Request{}, NewValidationError(CodeMissingField, "kind", "is required")
 	}
 	if r.kind, err = parseExternalKind(in.Kind); err != nil {
 		return Request{}, err
@@ -99,13 +99,13 @@ func NewRequest(in RequestInput) (Request, error) {
 func (r *Request) setReference(reference string) error {
 	switch {
 	case reference == "" && r.kind.RequiresReference():
-		return newValidationError(CodeReferenceRequired, "referenceExternalTransactionId", fmt.Sprintf("is required for %s", r.kind))
+		return NewValidationError(CodeReferenceRequired, "referenceExternalTransactionId", fmt.Sprintf("is required for %s", r.kind))
 	case reference == "":
 		return nil
 	case !r.kind.AcceptsReference():
-		return newValidationError(CodeReferenceNotAllowed, "referenceExternalTransactionId", fmt.Sprintf("is not allowed for %s", r.kind))
+		return NewValidationError(CodeReferenceNotAllowed, "referenceExternalTransactionId", fmt.Sprintf("is not allowed for %s", r.kind))
 	case reference == r.externalTransactionID:
-		return newValidationError(CodeSelfReference, "referenceExternalTransactionId", "must differ from externalTransactionId")
+		return NewValidationError(CodeSelfReference, "referenceExternalTransactionId", "must differ from externalTransactionId")
 	}
 	if err := validateIdentifier("referenceExternalTransactionId", reference, MaxIdentifierLength); err != nil {
 		return err
@@ -117,13 +117,13 @@ func (r *Request) setReference(reference string) error {
 func validateIdentifier(field, value string, maxLength int) error {
 	switch {
 	case value == "":
-		return newValidationError(CodeMissingField, field, "is required")
+		return NewValidationError(CodeMissingField, field, "is required")
 	case len(value) > maxLength:
-		return newValidationError(CodeInvalidField, field, fmt.Sprintf("must be at most %d bytes", maxLength))
+		return NewValidationError(CodeInvalidField, field, fmt.Sprintf("must be at most %d bytes", maxLength))
 	}
 	for i := range len(value) {
 		if value[i] < '!' || value[i] > '~' {
-			return newValidationError(CodeInvalidField, field, "must contain only visible ASCII characters")
+			return NewValidationError(CodeInvalidField, field, "must contain only visible ASCII characters")
 		}
 	}
 	return nil
@@ -131,30 +131,30 @@ func validateIdentifier(field, value string, maxLength int) error {
 
 func parseCanonicalUUID(field, value string) (uuid.UUID, error) {
 	if value == "" {
-		return uuid.Nil, newValidationError(CodeMissingField, field, "is required")
+		return uuid.Nil, NewValidationError(CodeMissingField, field, "is required")
 	}
 	id, err := uuid.Parse(value)
 	if err != nil || id.String() != value || id == uuid.Nil {
-		return uuid.Nil, newValidationError(CodeInvalidField, field, "must be a canonical lowercase UUID")
+		return uuid.Nil, NewValidationError(CodeInvalidField, field, "must be a canonical lowercase UUID")
 	}
 	return id, nil
 }
 
 func parseExternalMoney(amount, currency string) (money.Money, error) {
 	if amount == "" {
-		return money.Money{}, newValidationError(CodeMissingField, "money.amount", "is required")
+		return money.Money{}, NewValidationError(CodeMissingField, "money.amount", "is required")
 	}
 	if currency == "" {
-		return money.Money{}, newValidationError(CodeMissingField, "money.currency", "is required")
+		return money.Money{}, NewValidationError(CodeMissingField, "money.currency", "is required")
 	}
 	m, err := money.Parse(amount, currency)
 	switch {
 	case errors.Is(err, money.ErrInvalidCurrency):
-		return money.Money{}, newValidationError(CodeInvalidCurrency, "money.currency", "must be a supported ISO 4217 code")
+		return money.Money{}, NewValidationError(CodeInvalidCurrency, "money.currency", "must be a supported ISO 4217 code")
 	case errors.Is(err, money.ErrNegativeAmount):
-		return money.Money{}, newValidationError(CodeInvalidAmount, "money.amount", "must not be negative")
+		return money.Money{}, NewValidationError(CodeInvalidAmount, "money.amount", "must not be negative")
 	case err != nil:
-		return money.Money{}, newValidationError(CodeInvalidAmount, "money.amount", "must be a decimal string with exactly two fraction digits")
+		return money.Money{}, NewValidationError(CodeInvalidAmount, "money.amount", "must be a decimal string with exactly two fraction digits")
 	}
 	return m, nil
 }
@@ -162,12 +162,12 @@ func parseExternalMoney(amount, currency string) (money.Money, error) {
 func validateAmountPolicy(kind Kind, m money.Money) error {
 	if kind == KindLoss {
 		if !m.IsZero() {
-			return newValidationError(CodeLossAmountMustBeZero, "money.amount", "must be 0.00 for LOSS")
+			return NewValidationError(CodeLossAmountMustBeZero, "money.amount", "must be 0.00 for LOSS")
 		}
 		return nil
 	}
 	if !m.IsPositive() {
-		return newValidationError(CodeAmountMustBePositive, "money.amount", fmt.Sprintf("must be greater than zero for %s", kind))
+		return NewValidationError(CodeAmountMustBePositive, "money.amount", fmt.Sprintf("must be greater than zero for %s", kind))
 	}
 	return nil
 }

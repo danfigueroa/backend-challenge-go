@@ -18,7 +18,7 @@ type ValidationError struct {
 	Reason string
 }
 
-func newValidationError(code FailureCode, field, reason string) *ValidationError {
+func NewValidationError(code FailureCode, field, reason string) *ValidationError {
 	return &ValidationError{Code: code, Field: field, Reason: reason}
 }
 

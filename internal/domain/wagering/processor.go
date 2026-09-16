@@ -71,9 +71,9 @@ func CheckWallet(t *Transaction, w *wallet.Wallet) error {
 	case t.walletID != w.ID():
 		return fmt.Errorf("%w: transaction wallet %s, loaded wallet %s", ErrWalletMismatch, t.walletID, w.ID())
 	case t.playerID != w.PlayerID():
-		return newValidationError(CodeWalletPlayerMismatch, "playerId", "does not own the wallet")
+		return NewValidationError(CodeWalletPlayerMismatch, "playerId", "does not own the wallet")
 	case t.money.Currency() != w.Currency():
-		return newValidationError(CodeWalletCurrencyMismatch, "money.currency", fmt.Sprintf("wallet currency is %s", w.Currency()))
+		return NewValidationError(CodeWalletCurrencyMismatch, "money.currency", fmt.Sprintf("wallet currency is %s", w.Currency()))
 	}
 	return nil
 }

@@ -27,9 +27,9 @@ func parseExternalKind(s string) (Kind, error) {
 	case KindBet, KindWin, KindLoss, KindRefund, KindRollback:
 		return k, nil
 	case KindOpening:
-		return "", newValidationError(CodeOpeningNotAllowed, "kind", "OPENING is reserved for internal wallet opening")
+		return "", NewValidationError(CodeOpeningNotAllowed, "kind", "OPENING is reserved for internal wallet opening")
 	default:
-		return "", newValidationError(CodeUnsupportedKind, "kind", fmt.Sprintf("unsupported kind %q", s))
+		return "", NewValidationError(CodeUnsupportedKind, "kind", fmt.Sprintf("unsupported kind %q", s))
 	}
 }
 
