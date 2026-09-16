@@ -16,8 +16,8 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | E6 | Idempotência persistente (não em memória) | | | ⏳ |
 | E7 | Funciona com múltiplas instâncias | | | ⏳ |
 | E8 | Sem publicação anterior ao commit | | | ⏳ |
-| E9 | Ledger auditável | | | ⏳ |
-| E10 | PostgreSQL, SQS e IdP reais nos testes | | | ⏳ |
+| E9 | Ledger auditável | `ledger_entries` append-only, encadeado, versionado | `TestLedgerConstraints`, `TestLedgerRepository` | 🚧 |
+| E10 | PostgreSQL, SQS e IdP reais nos testes | PostgreSQL via testcontainers ✅; SQS e IdP nas próximas fases | `internal/adapter/postgres/*_integration_test.go` | 🚧 |
 
 ## Garantias obrigatórias (§5)
 
@@ -25,12 +25,12 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 |---|---|---|---|---|
 | G1 | Dinheiro sem `float32`/`float64` | `int64` em `money`; `forbidigo` no `.golangci.yml` | `make lint` | 🚧 |
 | G2 | Idempotência persistente e resistente a reinício | | | ⏳ |
-| G3 | Invariantes financeiras garantidas no banco | | | ⏳ |
+| G3 | Invariantes financeiras garantidas no banco | Migrations `000002`–`000004` (constraints, triggers, constraint triggers adiados) | `TestWalletConstraints`, `TestLedgerConstraints`, `TestTransactionConstraints` | ✅ |
 | G4 | Publicação só após commit | | | ⏳ |
-| G5 | Ledger append-only | | | ⏳ |
-| G6 | Carteiras independentes em paralelo; sem lock global | | | ⏳ |
-| G7 | Sem lost updates | | | ⏳ |
-| G8 | Unicidade, não negatividade e imutabilidade no schema | | | ⏳ |
+| G5 | Ledger append-only | Grants sem `UPDATE`/`DELETE` + triggers `ledger_entries_append_only` | `TestLedgerConstraints/append_only_*` | ✅ |
+| G6 | Carteiras independentes em paralelo; sem lock global | Lock de linha por carteira | `TestSameWalletSerializesAndDistinctWalletsProceedInParallel` | 🚧 |
+| G7 | Sem lost updates | `FOR UPDATE` + `WHERE version = $old` + trigger de versão + verificação adiada | `TestWalletRepository/stale_version…`, `TestConcurrentBetsOnSameWalletAtRepositoryLevel` | 🚧 |
+| G8 | Unicidade, não negatividade e imutabilidade no schema | Ver ARCHITECTURE › Invariantes impostas pelo banco | `schema_integration_test.go` | ✅ |
 
 ## Stack e composição (§4)
 
@@ -41,7 +41,7 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | S3 | Uber Fx com `fx.Module`/`fx.Provide`/`fx.Invoke` | | | ⏳ |
 | S4 | `fx.Lifecycle`: validação no start, workers canceláveis, shutdown ordenado | | | ⏳ |
 | S5 | Domínio independente de Fx/HTTP/SQS/persistência | `internal/domain` (depende só da stdlib e `google/uuid`) | `go list -deps ./internal/domain/...` | 🚧 |
-| S6 | Migrations versionadas com up/down documentados | | | ⏳ |
+| S6 | Migrations versionadas com up/down documentados | `migrations/`, `postgres.Migrator` | `TestMigrationsApplyRevertAndReapply` | 🚧 |
 | S7 | Docker Compose | | | ⏳ |
 
 ## Domínio (§6, §7)
@@ -54,13 +54,13 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | D4 | Wallet: criação, reidratação, débito/crédito, versão | `internal/domain/wallet/wallet.go` | `wallet_test.go` | ✅ |
 | D5 | WagerTransaction: máquina de estados e terminalidade | `internal/domain/wagering/transaction.go`, `status.go` | `TestStatusTransitions`, `TestTerminalTransactionsRejectTransitions`, `TestRehydrateValidation` | ✅ |
 | D6 | OPENING interno, rejeitado em HTTP/SQS | `NewOpening`, `parseExternalKind` | `TestNewOpening`, `TestNewRequestValidation/opening_kind`, `TestOpeningEvents` | 🚧 |
-| D7 | LedgerEntry imutável com `balanceAfter = balanceBefore ± money` | `internal/domain/wallet/ledger_entry.go` (domínio; banco na Fase 2) | `ledger_entry_test.go` | 🚧 |
+| D7 | LedgerEntry imutável com `balanceAfter = balanceBefore ± money` | Domínio `ledger_entry.go` + `CHECK ledger_entries_arithmetic` | `ledger_entry_test.go`, `TestLedgerConstraints` | ✅ |
 | D8 | Regras BET/WIN/LOSS/REFUND/ROLLBACK e política de zero | `wagering/processor.go`, `request.go` | `TestProcess*`, `TestZeroAmountPolicy`, `TestReferenceRules` | ✅ |
-| D9 | Reversão única e combinação REFUND/ROLLBACK | Domínio: `AlreadyReversed`; banco na Fase 2 | `TestRefundAndRollbackCombinations` | 🚧 |
+| D9 | Reversão única e combinação REFUND/ROLLBACK | Domínio `AlreadyReversed` + índice `wager_transactions_single_reversal` | `TestRefundAndRollbackCombinations`, `TestReversalUniquenessIsEnforcedByTheDatabase` | ✅ |
 | D10 | Reversão sem saldo com código distinto | `REVERSAL_INSUFFICIENT_FUNDS` | `TestReversalInsufficientFundsUsesDistinctCode` | ✅ |
 | D11 | `PENDING_REFERENCE` com backoff, limite e rejeição por expiração | Domínio: `PendingPolicy`, `awaitOrExpire`; worker na Fase 6 | `TestPendingReferenceLifecycle`, `TestPendingReferenceExpires*`, `TestPendingPolicyDelay` | 🚧 |
 | D12 | `failureCode` estáveis e documentados | `wagering/failure_code.go`; ARCHITECTURE › Códigos de falha | `TestParsers`, `TestNewRequestValidation` | ✅ |
-| D13 | Inbox e outbox | | | ⏳ |
+| D13 | Inbox e outbox | Tabelas + `InboxRepository`/`OutboxRepository` (workers na Fase 6) | `TestInboxRepository`, `TestOutboxRepository` | 🚧 |
 
 ## API HTTP (§9) e autenticação (§2)
 
@@ -113,16 +113,16 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | # | Cenário | Teste | Status |
 |---|---|---|---|
 | T1 | Unitários de Money, Wallet, estados, cinco tipos, conflito de payload, zero, OPENING | `internal/domain/{money,wallet,wagering,event}` (cobertura 94–99%) | ✅ |
-| T2 | Integração: migrations, constraints, imutabilidade, atomicidade | | ⏳ |
-| T3 | Integração: inbox, reentrega, outbox concorrente, retry, DLQ, reinício | | ⏳ |
+| T2 | Integração: migrations, constraints, imutabilidade, atomicidade | `migrations_integration_test.go`, `schema_integration_test.go`, `txmanager_integration_test.go` | ✅ |
+| T3 | Integração: inbox, reentrega, outbox concorrente, retry, DLQ, reinício | Repositório: `TestInboxConcurrentDeliveriesInsertOnce`, `TestClaimDuePendingIsExclusiveAcrossWorkers`; SQS na Fase 6 | 🚧 |
 | T4 | Composição Fx: start/stop e liberação de recursos | | ⏳ |
 | T5 | Auth: credenciais ausentes/inválidas/expiradas; isolamento; sem efeitos | | ⏳ |
 | T6 | Mesma aposta 50× em paralelo → um débito | | ⏳ |
-| T7 | Duas apostas de 80.00 sobre 100.00 | | ⏳ |
-| T8 | Carteiras distintas em paralelo | | ⏳ |
+| T7 | Duas apostas de 80.00 sobre 100.00 | Repositório: `TestConcurrentBetsOnSameWalletAtRepositoryLevel` (HTTP/SQS e multi-instância nas próximas fases) | 🚧 |
+| T8 | Carteiras distintas em paralelo | Repositório: `TestSameWalletSerializesAndDistinctWalletsProceedInParallel` | 🚧 |
 | T9 | Três instâncias independentes | | ⏳ |
 | T10 | Consumer interrompido após commit e antes do delete | | ⏳ |
-| T11 | Dois publishers disputando a outbox | | ⏳ |
+| T11 | Dois publishers disputando a outbox | Repositório: `TestOutboxConcurrentPublishersNeverShareRecords`, `TestOutboxRepository` (lease abandonado); worker na Fase 6 | 🚧 |
 | T12 | Reversão antes da referência: resolução e expiração | | ⏳ |
 | T13 | Reinício preserva idempotência, pendências e consistência | | ⏳ |
 | T14 | Cenários cruzando HTTP e SQS | | ⏳ |
