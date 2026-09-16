@@ -28,6 +28,8 @@ Regra de dependência: `domain` ← `app` ← `adapter`/`worker` ← `fxapp` ←
 | Banco | `pgx/v5` com SQL explícito, `golang-migrate`, PostgreSQL 18 | [Persistência](#persistência) |
 | Idempotência | Chave + hash persistidos, replay sem lock, double-check sob lock, unicidade como rede final | [Idempotência](#idempotência) |
 | Autorização | Verificada também nos casos de uso via `app.Actor` | [Casos de uso](#casos-de-uso) |
+| Composição | Uber Fx com módulos por camada e papéis por instância (`APP_ROLES`) | [Uso do Fx e shutdown](#uso-do-fx-e-shutdown) |
+| Observabilidade | `slog` JSON com campos de contexto, Prometheus em porta administrativa, OpenTelemetry opcional | [Observabilidade](#observabilidade) |
 | Invariantes | Constraints, FKs compostas, índices parciais, triggers e constraint triggers adiados; aplicação sem `UPDATE`/`DELETE` no ledger | [Invariantes impostas pelo banco](#invariantes-impostas-pelo-banco) |
 | Mensageria local | LocalStack `4.14.0` community | [Mensageria](#mensageria) |
 | Reversões | Cada transação revertida no máximo uma vez | [Reversões](#reversões) |
@@ -562,11 +564,100 @@ _A preencher na Fase 5._
 
 ## Uso do Fx e shutdown
 
-_A preencher na Fase 4._
+Pacote `internal/fxapp`. O binário `cmd/wallet` carrega e valida a configuração **antes** de montar o grafo e escolhe os módulos pelos papéis da instância (`APP_ROLES`), o que permite escalar API, consumidor, publisher e resolvedor de pendências de forma independente, ou rodar tudo em uma instância.
+
+| Módulo (`fx.Module`) | Provê (`fx.Provide`) | Ciclo de vida |
+|---|---|---|
+| `observability` | `*slog.Logger`, `*metrics.Metrics`, `app.Observer`, `*tracing.Provider`, `*health.Checker` | `OnStop`: flush/shutdown do tracer |
+| `postgres` | `postgres.Config`, `*pgxpool.Pool`, `app.TxManager`, repositórios (anotados como interfaces com `fx.As`) | `OnStart`: ping com retry até o prazo de start; `OnStop`: fecha o pool |
+| `application` | `app.Clock`, `app.IDGenerator`, `*walletapp.Service`, `*wageringapp.Service` | — |
+| `admin` | servidor HTTP administrativo (`/metrics`, `/health/live`, `/health/ready`) | `OnStart`: `net.Listen` síncrono (falha rápido); `OnStop`: `Shutdown` gracioso |
+| `pending-references` (papel `pendingref`) | `worker.Runner` do resolvedor | `OnStart`: inicia o loop; `OnStop`: cancela e aguarda término com prazo |
+
+`fx.Invoke` registra os health checks, o collector da outbox e força a construção dos componentes com ciclo de vida. Construtores não fazem I/O: o pool é criado de forma preguiçosa e a validação da dependência acontece no `OnStart`.
+
+### Ordem de inicialização e encerramento
+
+O Fx executa os hooks `OnStop` na ordem inversa dos `OnStart`. Como cada componente depende do que usa, a ordem é garantida pelo próprio grafo:
+
+```
+start:  tracer → pool (ping) → servidor admin → workers → [hook de drain]
+stop:   drain (readiness = DOWN) → workers → servidor admin → pool → tracer
+```
+
+1. **Drain**: o último hook registrado (`registerDrain`) é o primeiro a parar e faz `/health/ready` responder `503`, tirando a instância do balanceamento antes de interromper qualquer coisa.
+2. **Workers**: o `Runner` cancela o contexto do loop (nenhum trabalho novo é buscado) e espera o término (`Done`) até o prazo. A iteração em andamento usa um contexto próprio, desacoplado do cancelamento e com timeout (`PENDING_ITERATION_TIMEOUT` < `APP_SHUTDOWN_TIMEOUT`), então o lote corrente termina. Se o prazo estourar, as pendências não concluídas continuam protegidas pelo lease e são retomadas por outra instância.
+3. **Servidores HTTP**: `http.Server.Shutdown` para de aceitar conexões e aguarda as requisições em andamento (teste `TestServerLifecycleCompletesInFlightRequests`).
+4. **Dependências**: o pool do Postgres fecha só depois de todos os consumidores terem parado; o tracer é o último.
+
+`cmd/wallet serve` trata `SIGINT`/`SIGTERM`, aplica `APP_START_TIMEOUT`/`APP_SHUTDOWN_TIMEOUT` e devolve código de saída diferente de zero se a inicialização ou o encerramento falharem. Smoke test em container: `SIGTERM` → drain → worker parado → admin encerrado → pool fechado → exit 0.
+
+### Verificação
+
+- `TestApplicationGraphIsValidForEveryRoleCombination`: `fx.ValidateApp` para todas as combinações de papéis, sem I/O.
+- `TestApplicationStartsServesAndStopsCleanly` (integração, Postgres real): sobe a aplicação, verifica health e métricas, espera o worker resolver uma pendência em background, para a aplicação e confirma readiness em drain, pool fechado, servidor sem aceitar conexões e **nenhuma goroutine vazada** (`goleak`).
+- `TestApplicationFailsToStartWithoutDatabase`: start falha dentro do prazo se o banco não responde.
+
+### CLI
+
+| Comando | Uso |
+|---|---|
+| `wallet serve` | executa o serviço (padrão) |
+| `wallet migrate up` / `down [N]` / `version` | migrations embutidas, usando `DATABASE_MIGRATIONS_URL` (dono do schema) |
+| `wallet healthcheck` | consulta `/health/live` local; usado pelo `HEALTHCHECK` do Dockerfile (imagem distroless não tem `curl`) |
+
+### Imagem
+
+Build multi-stage `golang:1.27.1-alpine3.24` → `gcr.io/distroless/static-debian12:nonroot` (binário estático, `CGO_ENABLED=0`, usuário não-root, ~34 MB). O `ARG BUILD_TAGS` permite gerar a variante com injeção de falhas para os testes e2e.
 
 ## Observabilidade
 
-_A preencher na Fase 4._
+### Logs
+
+`log/slog` com `JSONHandler` em stdout (`internal/platform/logging`):
+
+- atributos fixos `service` e `instance`;
+- um handler de contexto adiciona automaticamente os identificadores guardados no `context.Context` (`correlationId`, `messageId`, `transactionId`, `walletId`, `providerId`) e `traceId`/`spanId` quando há span ativo;
+- redação de atributos cujo nome contenha `authorization`, `password`, `secret`, `token`, `credential`, `apikey` ou `cookie`;
+- payloads financeiros completos e parâmetros SQL nunca são registrados. O tracer do pgx é configurado **sem** `WithIncludeQueryParameters`.
+
+Divergência de reconciliação gera log `ERROR` com `walletId` e diferença.
+
+### Métricas
+
+Prometheus em `GET /metrics` no servidor administrativo (`ADMIN_ADDR`, separado da API pública). Registry próprio, sem estado global.
+
+| Métrica | Tipo | Labels | Requisito |
+|---|---|---|---|
+| `wallet_wagering_transactions_total` | counter | `channel`, `kind`, `status`, `failure_code` | resultados por status |
+| `wallet_wagering_idempotent_replays_total` | counter | `channel`, `kind`, `status` | duplicatas |
+| `wallet_wagering_idempotency_conflicts_total` | counter | `channel`, `code` | conflitos de idempotência |
+| `wallet_wagering_processing_duration_seconds` | histogram | `channel`, `kind`, `replay` | latência de processamento |
+| `wallet_operation_retries_total` | counter | `operation`, `reason` | retries |
+| `wallet_concurrency_conflicts_total` | counter | `operation` | conflitos de concorrência |
+| `wallet_reconciliations_total` / `wallet_reconciliation_divergences_total` | counter | `result` | divergências de reconciliação |
+| `wallet_pending_reference_resolutions_total` | counter | `outcome` | resolução de pendências |
+| `wallet_outbox_pending_events` / `wallet_outbox_lag_seconds` | gauge (lidos no scrape) | — | atraso da outbox |
+| `wallet_outbox_publish_attempts_total` / `wallet_outbox_publish_duration_seconds` | counter / histogram | `event_type`, `result` | publicação (Fase 6) |
+| `wallet_sqs_messages_total` / `wallet_sqs_dead_lettered_total` | counter | `queue`, `result`/`reason` | consumo e DLQ (Fase 6) |
+| `wallet_http_requests_total` / `wallet_http_request_duration_seconds` | counter / histogram | `route`, `method`, `code` | API (Fase 5) |
+| `wallet_worker_errors_total` | counter | `worker` | falhas de iteração |
+| `go_*`, `process_*` | — | — | runtime |
+
+O atraso da outbox é calculado no momento do scrape (`count` e `min(occurred_at)` dos não publicados, com timeout), então é o mesmo valor em qualquer instância e não depende de um publisher estar ativo. `wallet_outbox_backlog_scrape_success` indica falha na leitura.
+
+### Tracing
+
+OpenTelemetry com exportador OTLP/HTTP (`OTEL_TRACES_ENABLED=true`), propagação W3C `traceparent`, amostragem `ParentBased(TraceIDRatio)` configurada em percentual inteiro (`OTEL_TRACES_SAMPLE_PERCENT`, evitando ponto flutuante na configuração) e instrumentação automática das queries via `otelpgx`. Desabilitado, usa provider no-op sem custo.
+
+### Health checks
+
+| Endpoint | Semântica |
+|---|---|
+| `GET /health/live` | processo ativo (sempre `200` enquanto o servidor responde) |
+| `GET /health/ready` | `200` se todas as dependências respondem (PostgreSQL agora, SQS na Fase 6); `503` com detalhe por dependência caso contrário, ou durante o drain do shutdown |
+
+Os checks rodam em paralelo, com timeout individual (`DATABASE_HEALTH_TIMEOUT`) e cache de 1 s para que probes frequentes não sobrecarreguem o banco. Nesta fase os endpoints estão no servidor administrativo; na Fase 5 também serão expostos na API pública.
 
 ## Limitações e interpretações
 
@@ -576,4 +667,5 @@ _A preencher na Fase 4._
 - **Reversão única por transação**: um `ROLLBACK` de `REFUND` não reabre a `BET` para nova devolução.
 - **Custo das verificações adiadas**: os constraint triggers executam algumas leituras por linha alterada no commit. É um custo deliberado em troca de integridade garantida pelo banco; em volumes muito altos poderia ser substituído por reconciliação contínua.
 - **Superusuário**: triggers protegem contra `UPDATE`/`DELETE`/`TRUNCATE` inclusive do dono do schema, mas um superusuário pode desabilitá-los (`session_replication_role`, `ALTER TABLE ... DISABLE TRIGGER`). Em produção o dono do schema não deve ser superusuário e o acesso administrativo deve ser auditado. No ambiente local o `POSTGRES_USER` do container é superusuário por conveniência.
+- **Aleatoriedade**: `math/rand/v2` é usado apenas para jitter de backoff; por isso a regra G404 do gosec está desabilitada. Identificadores usam UUIDv7 (`crypto/rand`).
 - **Retenção da outbox**: eventos publicados podem ser apagados (o trigger só retém os não publicados), mas o job de retenção não faz parte do escopo.
