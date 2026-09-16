@@ -26,6 +26,8 @@ Regra de dependência: `domain` ← `app` ← `adapter`/`worker` ← `fxapp` ←
 | Dinheiro | `int64` em unidades mínimas, `BIGINT` no Postgres, formato estrito | [Dinheiro](#dinheiro) |
 | Concorrência | Lock pessimista por carteira + versão condicionada + constraints | [Concorrência](#concorrência) |
 | Banco | `pgx/v5` com SQL explícito, `golang-migrate`, PostgreSQL 18 | [Persistência](#persistência) |
+| Idempotência | Chave + hash persistidos, replay sem lock, double-check sob lock, unicidade como rede final | [Idempotência](#idempotência) |
+| Autorização | Verificada também nos casos de uso via `app.Actor` | [Casos de uso](#casos-de-uso) |
 | Invariantes | Constraints, FKs compostas, índices parciais, triggers e constraint triggers adiados; aplicação sem `UPDATE`/`DELETE` no ledger | [Invariantes impostas pelo banco](#invariantes-impostas-pelo-banco) |
 | Mensageria local | LocalStack `4.14.0` community | [Mensageria](#mensageria) |
 | Reversões | Cada transação revertida no máximo uma vez | [Reversões](#reversões) |
@@ -414,9 +416,86 @@ Executados contra PostgreSQL real (`postgres:18.6-alpine3.24`) via testcontainer
 - concorrência real: claim de pendências e da outbox por vários workers sem sobreposição, entregas simultâneas na inbox, duas apostas de 80.00 sobre 100.00, lock de uma carteira sem bloquear outra, timeout de lock classificado como transitório;
 - teste de mutação manual: removendo `AND version = $old` do `UPDATE`, o teste de escrita concorrente falha e o trigger `wallets_version_follows_balance` ainda impede o lost update.
 
+## Casos de uso
+
+Pacotes `internal/app/walletapp` e `internal/app/wageringapp`. Dependem apenas dos ports (`internal/app/ports.go`) e do domínio; não conhecem HTTP, SQS nem pgx.
+
+| Caso de uso | Serviço | Transação SQL |
+|---|---|---|
+| `OpenWallet` | `walletapp` | carteira + `OPENING` + lançamento + 2 eventos em um commit |
+| `GetWallet`, `ListLedger` | `walletapp` | leitura (ledger em snapshot) |
+| `Reconcile` | `walletapp` | `REPEATABLE READ READ ONLY` |
+| `Process` (HTTP e SQS) | `wageringapp` | transação + saldo + ledger + outbox + inbox em um commit |
+| `ResolveDuePending` | `wageringapp` | claim curto + um commit por pendência |
+| `GetTransaction`, `GetByExternalID` | `wageringapp` | leitura |
+
+### Autorização na camada de aplicação
+
+Além da validação do token no HTTP (Fase 5), todo caso de uso recebe um `app.Actor`, e a regra é verificada **também aqui**. Assim, nenhum adapter consegue esquecer a checagem.
+
+| Actor | Origem | Pode |
+|---|---|---|
+| `PROVIDER` (com `providerId` do token) | HTTP de provedor | processar e ler **somente** transações do próprio `providerId` |
+| `SERVICE` | HTTP de serviço interno | operações de carteira, reconciliação, leitura de qualquer transação |
+| `BROKER` | consumidor SQS | processar mensagens (acesso à fila controlado pelo broker; validações de domínio mantidas) |
+
+- Provedor enviando `providerId` diferente do seu: `app.ErrForbidden`, **antes** de qualquer leitura ou escrita.
+- Consulta por ID de transação de outro provedor (ou de uma `OPENING` interna): `app.ErrNotFound`, sem revelar que o registro existe.
+- Consulta por `/providers/{outro}/...`: `app.ErrForbidden`.
+
+### Retry de falhas transitórias
+
+`app.Retry` reexecuta a unidade de trabalho inteira (nova transação) com backoff exponencial e jitter quando o erro é `ErrTransient`, `ErrConcurrentUpdate` ou uma violação de unicidade que indica corrida (chave de idempotência, ID externo, reversão, inbox, versão do ledger). Erros de validação, autorização, conflitos lógicos e integridade não são reexecutados. Esgotadas as tentativas, o erro transitório é propagado (o HTTP devolverá `503`, o SQS devolverá a mensagem à fila).
+
+### Observabilidade dos casos de uso
+
+Os serviços recebem um `app.Observer` (implementado com Prometheus na Fase 4) e emitem, **após o commit**: transação concluída (canal, tipo, status, código, replay e latência), conflito de idempotência, retry e resultado de reconciliação.
+
 ## Idempotência
 
-_A preencher na Fase 3._
+### Fluxo de `Process`
+
+```mermaid
+sequenceDiagram
+    participant C as HTTP/SQS
+    participant A as wageringapp.Process
+    participant DB as PostgreSQL
+    C->>A: RequestInput (+ Delivery no SQS)
+    A->>A: autoriza actor, NewRequest (validação + hash)
+    alt sem Delivery (HTTP)
+        A->>DB: busca por (provider, key) ou (provider, externalId)
+        DB-->>A: encontrada → replay/conflito sem lock
+    end
+    A->>DB: BEGIN
+    opt Delivery (SQS)
+        A->>DB: INSERT inbox ON CONFLICT DO NOTHING
+        DB-->>A: já existia → mesmo hash: replay / hash diferente: ErrInboxMismatch
+    end
+    A->>DB: SELECT wallet FOR UPDATE
+    A->>DB: nova busca por chave/externalId (double-check sob lock)
+    A->>DB: SELECT referência FOR UPDATE (se houver)
+    A->>A: wagering.Process (domínio)
+    A->>DB: INSERT transação, UPDATE wallet (versão), INSERT ledger, INSERT outbox, acorda pendências, marca inbox
+    A->>DB: COMMIT (triggers adiados validam consistência)
+```
+
+| Situação | Resultado |
+|---|---|
+| Chave e payload iguais | Resultado persistido com `IdempotentReplay = true`, **com o saldo do processamento original** |
+| Chave igual, payload diferente | `IDEMPOTENCY_KEY_CONFLICT` |
+| Mesmo `(providerId, externalTransactionId)` com outra chave | `EXTERNAL_TRANSACTION_CONFLICT` |
+| Erro corrigível (validação, carteira inexistente, jogador/moeda divergentes) | Nada é persistido; a chave continua livre para uma requisição corrigida |
+| Mesma operação por HTTP e SQS | A segunda é replay (mesma chave e mesmo hash nas duas portas) |
+| Reentrega SQS com o mesmo `messageId` | Detectada pela inbox; replay marcado como `DuplicateDelivery` |
+| Mesmo `messageId` com corpo diferente | `app.ErrInboxMismatch` (erro permanente, mensagem vai para a DLQ) |
+| Replay de transação pendente | Devolve o estado atual (`PENDING_REFERENCE`) |
+
+### Garantias sob concorrência
+
+- **Caminho rápido**: replays via HTTP são respondidos sem pegar o lock da carteira, então reenvios em massa não disputam lock com operações novas.
+- **Double-check sob lock**: requisições idênticas simultâneas serializam no lock da carteira; a segunda relê a chave depois que a primeira commitou e vira replay.
+- **Rede final**: se duas requisições com a mesma chave apontarem para carteiras diferentes (locks distintos), a unicidade `(provider_id, idempotency_key)` rejeita a segunda. O erro é tratado como corrida e reexecutado, e a nova execução encontra a transação e responde conflito ou replay.
+- **Bug encontrado pelos testes**: em `READ COMMITTED` cada consulta enxerga um snapshot novo. A busca por chave podia não encontrar nada e a busca seguinte, por `externalTransactionId`, já encontrar a transação commitada por uma requisição idêntica, o que gerava um falso `EXTERNAL_TRANSACTION_CONFLICT` (5 de 50 no teste de 50 apostas simultâneas). A correção compara a chave da transação encontrada antes de classificar o conflito.
 
 ## Concorrência
 
@@ -428,7 +507,43 @@ Coordenação **por carteira**, com três camadas independentes:
 
 Ordem de aquisição de locks: **carteira → transações** (referência e pendência). O worker de referências pendentes faz o claim em uma transação curta (`FOR UPDATE SKIP LOCKED` + lease em `next_attempt_at`) e processa cada item em transação própria respeitando a mesma ordem, evitando deadlock com o fluxo síncrono. `lock_timeout` limita a espera; o timeout é classificado como transitório.
 
-_O detalhamento do fluxo nos casos de uso será documentado na Fase 3._
+Testes de integração que comprovam o comportamento com PostgreSQL real:
+
+| Cenário | Teste | Resultado verificado |
+|---|---|---|
+| Mesma aposta 50× em paralelo | `TestSameBetFiftyTimesInParallelDebitsOnce` | 1 transação, 49 replays, 1 débito, saldo 975.00 |
+| Duas apostas de 80.00 sobre 100.00 | `TestTwoConcurrentBetsOfEightyOnHundred` | 1 `PROCESSED`, 1 `REJECTED INSUFFICIENT_FUNDS`, saldo 20.00, 1 débito; reenvios viram replay |
+| 10 carteiras × 10 apostas simultâneas | `TestDistinctWalletsAreProcessedInParallel` | todas processadas, saldos e versões corretos |
+| HTTP e SQS simultâneos para a mesma operação | `TestConcurrentHTTPAndSQSForTheSameOperation` | 1 transação, 10 mensagens na inbox |
+| Três instâncias resolvendo pendências | `TestConcurrentWorkersResolveEachPendingOnce` | cada pendência processada uma única vez |
+
+Todos terminam verificando que o saldo de cada carteira é igual à soma do ledger. A execução com múltiplos **processos** independentes é coberta na Fase 7.
+
+## Worker de referências pendentes
+
+`ResolveDuePending(limit)` executa um ciclo do worker (o loop com `fx.Lifecycle` vem na Fase 6):
+
+1. Transação curta: `ClaimDuePending` seleciona até `limit` pendências vencidas com `FOR UPDATE SKIP LOCKED` e empurra `next_attempt_at` para `now + lease`. Outras instâncias não pegam o mesmo item enquanto o lease vale.
+2. Para cada item, em transação própria e na ordem de locks **carteira → transação → referência**: relê o estado (se já estiver terminal, nada acontece), resolve a referência e chama `wagering.Process`.
+3. Resultado:
+   - `PROCESSED`/`REJECTED`: grava a transação, a carteira, o lançamento, os eventos e acorda dependentes.
+   - ainda pendente: grava o novo agendamento sem novo evento, porque `WagerTransactionPendingReference` só é emitido no primeiro registro.
+4. Erro transitório: o item fica para depois (o lease expira e qualquer instância o retoma).
+5. Erro permanente inesperado: a transação vai para `FAILED` com `INTERNAL_PROCESSING_FAILED`, para auditoria.
+
+Quando uma operação é processada, `WakeWaitingOn` antecipa `next_attempt_at` das pendências que a referenciam, então uma reversão que chegou antes da aposta é resolvida no próximo ciclo, sem esperar o backoff.
+
+Como o estado vive só no banco, pendências sobrevivem a reinícios e são retomadas por qualquer instância (`TestPendingSurvivesRestartAndIsResumedByAnotherInstance`).
+
+## Reconciliação
+
+`Reconcile` abre uma transação `REPEATABLE READ READ ONLY` (visão consistente entre a carteira e o ledger) e calcula:
+
+- `calculatedBalance` = soma dos créditos menos débitos, incluindo a abertura;
+- `difference` = `storedBalance − calculatedBalance`;
+- `consistent` exige diferença zero, cadeia do ledger íntegra (`balance_before[n] = balance_after[n−1]`), versão da carteira igual à do último lançamento e saldo igual ao `balance_after` do último lançamento (ou versão 1 com saldo zero, sem lançamentos).
+
+A reconciliação nunca altera dados. O resultado é enviado ao `Observer` (métrica e log de divergência na Fase 4). O teste `TestReconciliationDetectsDivergenceWithoutChangingBalance` cria uma divergência real desligando os triggers numa sessão de superusuário (`session_replication_role = replica`) e confirma que ela é reportada.
 
 ## Mensageria
 
