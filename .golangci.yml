@@ -50,6 +50,10 @@ linters:
           - gosec
           - wrapcheck
           - forbidigo
+          - contextcheck
+      - path: internal/testsupport/
+        linters:
+          - wrapcheck
       - path: internal/platform/(metrics|tracing)/
         linters:
           - forbidigo
