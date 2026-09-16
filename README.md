@@ -33,4 +33,19 @@ make fuzz               # fuzzing do parser de Money por 30s
 make lint               # gofmt, go vet e golangci-lint
 ```
 
+## Testes
+
+```sh
+make test               # unitários (go test -race ./...)
+make test-integration   # unitários + integração com PostgreSQL real (testcontainers-go)
+```
+
+Os testes de integração usam a build tag `integration` e precisam apenas do Docker em execução: o container `postgres:18.6-alpine3.24` é criado e removido automaticamente. Comando equivalente sem Make:
+
+```sh
+go test -race -count=1 -tags=integration ./...
+```
+
+> **macOS**: o detector de corrida não precisa de cgo no macOS. Se o linker falhar com `unknown architecture arm64e` (Command Line Tools desatualizadas em relação ao SDK), execute com `CGO_ENABLED=0`; o `Makefile` já faz isso automaticamente no Darwin.
+
 As seções de execução, variáveis de ambiente, migrations, filas, autenticação, exemplos de chamadas e testes de integração/falhas serão adicionadas à medida que cada componente for entregue.
