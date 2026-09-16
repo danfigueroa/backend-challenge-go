@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -19,6 +20,8 @@ type Config struct {
 	MinConns         int32
 	LockTimeout      time.Duration
 	StatementTimeout time.Duration
+	ApplicationName  string
+	Tracer           pgx.QueryTracer
 }
 
 func (c Config) Validate() error {
@@ -33,7 +36,7 @@ func (c Config) Validate() error {
 	return nil
 }
 
-func NewPool(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
+func NewLazyPool(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -44,17 +47,48 @@ func NewPool(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
 	poolCfg.MaxConns = cfg.MaxConns
 	poolCfg.MinConns = cfg.MinConns
 	poolCfg.ConnConfig.RuntimeParams["timezone"] = "UTC"
-	poolCfg.ConnConfig.RuntimeParams["application_name"] = "wallet-service"
+	poolCfg.ConnConfig.RuntimeParams["application_name"] = cmp.Or(cfg.ApplicationName, "wallet-service")
+	if cfg.Tracer != nil {
+		poolCfg.ConnConfig.Tracer = cfg.Tracer
+	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, translate(err)
+	}
+	return pool, nil
+}
+
+func NewPool(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
+	pool, err := NewLazyPool(ctx, cfg)
+	if err != nil {
+		return nil, err
 	}
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
 		return nil, translate(err)
 	}
 	return pool, nil
+}
+
+func WaitReady(ctx context.Context, pool *pgxpool.Pool, interval time.Duration) error {
+	for {
+		err := pool.Ping(ctx)
+		if err == nil {
+			return nil
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("postgres: not ready: %w", errors.Join(translate(err), ctx.Err()))
+		case <-timer.C:
+		}
+	}
+}
+
+func Ping(ctx context.Context, pool *pgxpool.Pool) error {
+	return translate(pool.Ping(ctx))
 }
 
 type querier interface {
