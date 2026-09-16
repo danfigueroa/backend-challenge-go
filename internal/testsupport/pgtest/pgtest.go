@@ -57,6 +57,7 @@ func Start(ctx context.Context) (*Instance, error) {
 		tcpostgres.WithPassword(OwnerPassword),
 		tcpostgres.WithInitScripts(filepath.Join(RepoRoot(), "deploy", "postgres", "init", "01-create-app-user.sh")),
 		testcontainers.WithEnv(map[string]string{"APP_DB_USER": AppUser, "APP_DB_PASSWORD": AppPassword}),
+		testcontainers.WithCmd("postgres", "-c", "fsync=off", "-c", "max_connections=1000"),
 		tcpostgres.BasicWaitStrategies(),
 	)
 	if err != nil {
