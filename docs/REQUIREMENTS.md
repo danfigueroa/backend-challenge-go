@@ -9,11 +9,11 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | # | Critério eliminatório | Implementação | Evidência | Status |
 |---|---|---|---|---|
 | E1 | Autenticação efetiva nos endpoints de negócio | | | ⏳ |
-| E2 | Sem acesso não autorizado a operações/transações | | | ⏳ |
+| E2 | Sem acesso não autorizado a operações/transações | Casos de uso: `app.Actor` (HTTP na Fase 5) | `TestProviderIsolation`, `TestActorAuthorization`, `TestOpenWalletConflictAndValidation` | 🚧 |
 | E3 | Sem cálculo monetário em ponto flutuante | `internal/domain/money`; `forbidigo` | `make lint`, `FuzzParse` | 🚧 |
-| E4 | Sem saldo negativo por concorrência | | | ⏳ |
-| E5 | Sem movimentação duplicada | | | ⏳ |
-| E6 | Idempotência persistente (não em memória) | | | ⏳ |
+| E4 | Sem saldo negativo por concorrência | Lock por carteira + `CHECK` | `TestTwoConcurrentBetsOfEightyOnHundred`, `TestDistinctWalletsAreProcessedInParallel` | 🚧 |
+| E5 | Sem movimentação duplicada | Idempotência + inbox + unicidades | `TestSameBetFiftyTimesInParallelDebitsOnce`, `TestConcurrentHTTPAndSQSForTheSameOperation` | 🚧 |
+| E6 | Idempotência persistente (não em memória) | `wager_transactions` (chave, hash, resultado) | `TestReplayAfterRestartUsesPersistedState` | ✅ |
 | E7 | Funciona com múltiplas instâncias | | | ⏳ |
 | E8 | Sem publicação anterior ao commit | | | ⏳ |
 | E9 | Ledger auditável | `ledger_entries` append-only, encadeado, versionado | `TestLedgerConstraints`, `TestLedgerRepository` | 🚧 |
@@ -24,7 +24,7 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | # | Garantia | Implementação | Evidência | Status |
 |---|---|---|---|---|
 | G1 | Dinheiro sem `float32`/`float64` | `int64` em `money`; `forbidigo` no `.golangci.yml` | `make lint` | 🚧 |
-| G2 | Idempotência persistente e resistente a reinício | | | ⏳ |
+| G2 | Idempotência persistente e resistente a reinício | Chave + hash + resultado persistidos | `TestReplayAfterRestartUsesPersistedState`, `TestPendingSurvivesRestartAndIsResumedByAnotherInstance` | ✅ |
 | G3 | Invariantes financeiras garantidas no banco | Migrations `000002`–`000004` (constraints, triggers, constraint triggers adiados) | `TestWalletConstraints`, `TestLedgerConstraints`, `TestTransactionConstraints` | ✅ |
 | G4 | Publicação só após commit | | | ⏳ |
 | G5 | Ledger append-only | Grants sem `UPDATE`/`DELETE` + triggers `ledger_entries_append_only` | `TestLedgerConstraints/append_only_*` | ✅ |
@@ -53,12 +53,12 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | D3 | Money: incompatibilidade de moedas | `money.go` (`compatible`) | `TestCurrencyMismatch` | ✅ |
 | D4 | Wallet: criação, reidratação, débito/crédito, versão | `internal/domain/wallet/wallet.go` | `wallet_test.go` | ✅ |
 | D5 | WagerTransaction: máquina de estados e terminalidade | `internal/domain/wagering/transaction.go`, `status.go` | `TestStatusTransitions`, `TestTerminalTransactionsRejectTransitions`, `TestRehydrateValidation` | ✅ |
-| D6 | OPENING interno, rejeitado em HTTP/SQS | `NewOpening`, `parseExternalKind` | `TestNewOpening`, `TestNewRequestValidation/opening_kind`, `TestOpeningEvents` | 🚧 |
+| D6 | OPENING interno, rejeitado em HTTP/SQS | `NewOpening`, `parseExternalKind`, `walletapp.OpenWallet` | `TestNewOpening`, `TestOpenWalletWithPositiveBalance`, `TestCorrectableErrorsAreNotPersisted` | ✅ |
 | D7 | LedgerEntry imutável com `balanceAfter = balanceBefore ± money` | Domínio `ledger_entry.go` + `CHECK ledger_entries_arithmetic` | `ledger_entry_test.go`, `TestLedgerConstraints` | ✅ |
 | D8 | Regras BET/WIN/LOSS/REFUND/ROLLBACK e política de zero | `wagering/processor.go`, `request.go` | `TestProcess*`, `TestZeroAmountPolicy`, `TestReferenceRules` | ✅ |
 | D9 | Reversão única e combinação REFUND/ROLLBACK | Domínio `AlreadyReversed` + índice `wager_transactions_single_reversal` | `TestRefundAndRollbackCombinations`, `TestReversalUniquenessIsEnforcedByTheDatabase` | ✅ |
 | D10 | Reversão sem saldo com código distinto | `REVERSAL_INSUFFICIENT_FUNDS` | `TestReversalInsufficientFundsUsesDistinctCode` | ✅ |
-| D11 | `PENDING_REFERENCE` com backoff, limite e rejeição por expiração | Domínio: `PendingPolicy`, `awaitOrExpire`; worker na Fase 6 | `TestPendingReferenceLifecycle`, `TestPendingReferenceExpires*`, `TestPendingPolicyDelay` | 🚧 |
+| D11 | `PENDING_REFERENCE` com backoff, limite e rejeição por expiração | `PendingPolicy`, `ResolveDuePending` (loop do worker na Fase 6) | `TestReversalArrivingBeforeReferenceIsResolvedLater`, `TestPendingReferenceExpiresWithRejection` | 🚧 |
 | D12 | `failureCode` estáveis e documentados | `wagering/failure_code.go`; ARCHITECTURE › Códigos de falha | `TestParsers`, `TestNewRequestValidation` | ✅ |
 | D13 | Inbox e outbox | Tabelas + `InboxRepository`/`OutboxRepository` (workers na Fase 6) | `TestInboxRepository`, `TestOutboxRepository` | 🚧 |
 
@@ -66,22 +66,22 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 
 | # | Requisito | Implementação | Evidência | Status |
 |---|---|---|---|---|
-| H1 | `POST /wallets` com OPENING, ledger e outbox atômicos; conflito em duplicata | | | ⏳ |
+| H1 | `POST /wallets` com OPENING, ledger e outbox atômicos; conflito em duplicata | Caso de uso `OpenWallet` (HTTP na Fase 5) | `TestOpenWallet*` | 🚧 |
 | H2 | `GET /wallets/:id` | | | ⏳ |
-| H3 | `GET /wallets/:id/ledger` com cursor opaco | | | ⏳ |
+| H3 | `GET /wallets/:id/ledger` com cursor opaco | Caso de uso `ListLedger` (cursor base64url vinculado à carteira) | `TestGetWalletAndLedgerPagination`, `TestCursorRejectsTampering` | 🚧 |
 | H4 | `GET /wagering/transactions/:id` | | | ⏳ |
 | H5 | `GET /providers/:providerId/wagering/transactions/:externalId` | | | ⏳ |
 | H6 | `POST /wagering/transactions` com `Idempotency-Key` obrigatório | | | ⏳ |
-| H7 | Hash canônico e equivalência HTTP/SQS | `wagering.NewRequest` (ponto único), `CanonicalPayload` | `TestCanonicalPayloadGolden`, `TestCanonicalPayloadMatchesSortedJSONOracle`, `TestPayloadHash*` | 🚧 |
-| H8 | Replay devolve saldo original com `idempotentReplay: true` | | | ⏳ |
-| H9 | Conflitos de chave e de `(providerId, externalTransactionId)` | | | ⏳ |
+| H7 | Hash canônico e equivalência HTTP/SQS | `wagering.NewRequest` usado pelas duas portas | `TestCanonicalPayloadGolden`, `TestSQSDeliveriesAreDeduplicatedByInboxAndIdempotency` | 🚧 |
+| H8 | Replay devolve saldo original com `idempotentReplay: true` | `ProcessResult.IdempotentReplay` + resultado persistido | `TestBetIsProcessedAndReplayReturnsOriginalBalance` | 🚧 |
+| H9 | Conflitos de chave e de `(providerId, externalTransactionId)` | `IdempotencyConflictError` | `TestIdempotencyConflicts` | 🚧 |
 | H10 | Códigos HTTP distinguíveis documentados | | | ⏳ |
-| H11 | `POST /wallets/:id/reconciliation` | | | ⏳ |
+| H11 | `POST /wallets/:id/reconciliation` | Caso de uso `Reconcile` (snapshot read-only) | `TestReconciliation*`, `TestBuildReport` | 🚧 |
 | H12 | `/health/live` e `/health/ready` | | | ⏳ |
 | A1 | IdP OIDC externo (Keycloak) provisionado automaticamente | | | ⏳ |
 | A2 | `providerId` determinado pela identidade | | | ⏳ |
-| A3 | Isolamento entre provedores (consultas e replays) | | | ⏳ |
-| A4 | Operações de carteira restritas ao serviço interno | | | ⏳ |
+| A3 | Isolamento entre provedores (consultas e replays) | `app.Actor` nos casos de uso | `TestProviderIsolation` | 🚧 |
+| A4 | Operações de carteira restritas ao serviço interno | `RequireInternalService` | `TestOpenWalletConflictAndValidation`, `TestGetWalletAndLedgerPagination` | 🚧 |
 | A5 | Credenciais e políticas do broker | | | ⏳ |
 
 ## Mensageria (§10, §11)
@@ -89,7 +89,7 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | # | Requisito | Implementação | Evidência | Status |
 |---|---|---|---|---|
 | M1 | Filas `wager-transactions.fifo` e DLQ com redrive | | | ⏳ |
-| M2 | Inbox na mesma transação do domínio | | | ⏳ |
+| M2 | Inbox na mesma transação do domínio | `wageringapp.Process` com `Delivery` | `TestSQSDeliveriesAreDeduplicatedByInboxAndIdempotency` | 🚧 |
 | M3 | Delete somente após commit | | | ⏳ |
 | M4 | Retry com backoff; DLQ para permanentes/esgotados | | | ⏳ |
 | M5 | Shutdown: para de buscar, conclui ou libera visibilidade | | | ⏳ |
@@ -117,16 +117,16 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | T3 | Integração: inbox, reentrega, outbox concorrente, retry, DLQ, reinício | Repositório: `TestInboxConcurrentDeliveriesInsertOnce`, `TestClaimDuePendingIsExclusiveAcrossWorkers`; SQS na Fase 6 | 🚧 |
 | T4 | Composição Fx: start/stop e liberação de recursos | | ⏳ |
 | T5 | Auth: credenciais ausentes/inválidas/expiradas; isolamento; sem efeitos | | ⏳ |
-| T6 | Mesma aposta 50× em paralelo → um débito | | ⏳ |
-| T7 | Duas apostas de 80.00 sobre 100.00 | Repositório: `TestConcurrentBetsOnSameWalletAtRepositoryLevel` (HTTP/SQS e multi-instância nas próximas fases) | 🚧 |
-| T8 | Carteiras distintas em paralelo | Repositório: `TestSameWalletSerializesAndDistinctWalletsProceedInParallel` | 🚧 |
+| T6 | Mesma aposta 50× em paralelo → um débito | `TestSameBetFiftyTimesInParallelDebitsOnce` (HTTP/multi-processo na Fase 7) | 🚧 |
+| T7 | Duas apostas de 80.00 sobre 100.00 | `TestTwoConcurrentBetsOfEightyOnHundred`, `TestConcurrentBetsOnSameWalletAtRepositoryLevel` (multi-processo na Fase 7) | 🚧 |
+| T8 | Carteiras distintas em paralelo | `TestDistinctWalletsAreProcessedInParallel`, `TestSameWalletSerializesAndDistinctWalletsProceedInParallel` | 🚧 |
 | T9 | Três instâncias independentes | | ⏳ |
 | T10 | Consumer interrompido após commit e antes do delete | | ⏳ |
 | T11 | Dois publishers disputando a outbox | Repositório: `TestOutboxConcurrentPublishersNeverShareRecords`, `TestOutboxRepository` (lease abandonado); worker na Fase 6 | 🚧 |
-| T12 | Reversão antes da referência: resolução e expiração | | ⏳ |
-| T13 | Reinício preserva idempotência, pendências e consistência | | ⏳ |
-| T14 | Cenários cruzando HTTP e SQS | | ⏳ |
-| T15 | Reconciliação final saldo × ledger | | ⏳ |
+| T12 | Reversão antes da referência: resolução e expiração | `TestReversalArrivingBeforeReferenceIsResolvedLater`, `TestPendingReferenceExpiresWithRejection` | 🚧 |
+| T13 | Reinício preserva idempotência, pendências e consistência | `TestReplayAfterRestartUsesPersistedState`, `TestPendingSurvivesRestartAndIsResumedByAnotherInstance` (processos reais na Fase 7) | 🚧 |
+| T14 | Cenários cruzando HTTP e SQS | Casos de uso: `TestSQSDeliveriesAreDeduplicatedByInboxAndIdempotency`, `TestConcurrentHTTPAndSQSForTheSameOperation` | 🚧 |
+| T15 | Reconciliação final saldo × ledger | `apptest.AssertAllWalletsReconcile` ao final dos cenários | 🚧 |
 | T16 | Teste de carga k6 (opcional) | | ⏳ |
 
 ## Entrega (§15)
