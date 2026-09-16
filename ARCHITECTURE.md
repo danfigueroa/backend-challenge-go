@@ -25,7 +25,8 @@ Regra de dependência: `domain` ← `app` ← `adapter`/`worker` ← `fxapp` ←
 | Go | 1.27.1 em `go.mod` e `golang:1.27.1-alpine` no Dockerfile | — |
 | Dinheiro | `int64` em unidades mínimas, `BIGINT` no Postgres, formato estrito | [Dinheiro](#dinheiro) |
 | Concorrência | Lock pessimista por carteira + versão condicionada + constraints | [Concorrência](#concorrência) |
-| Banco | `pgx/v5` com SQL explícito, `golang-migrate` | [Transações SQL](#transações-sql) |
+| Banco | `pgx/v5` com SQL explícito, `golang-migrate`, PostgreSQL 18 | [Persistência](#persistência) |
+| Invariantes | Constraints, FKs compostas, índices parciais, triggers e constraint triggers adiados; aplicação sem `UPDATE`/`DELETE` no ledger | [Invariantes impostas pelo banco](#invariantes-impostas-pelo-banco) |
 | Mensageria local | LocalStack `4.14.0` community | [Mensageria](#mensageria) |
 | Reversões | Cada transação revertida no máximo uma vez | [Reversões](#reversões) |
 | Referências pendentes | TTL (padrão 30 min) + backoff exponencial com jitter; `WIN` com referência também aguarda | [Referências](#referências) |
@@ -302,9 +303,116 @@ Timestamps sempre em UTC, RFC 3339 com milissegundos; valores monetários no for
 
 "Dados da transação" = `transactionId`, `origin`, `kind`, `walletId`, `playerId`, `money` e, apenas para origem externa, `providerId`, `externalTransactionId`, `roundId`, `gameId`, `referenceExternalTransactionId`. Eventos de `OPENING` omitem esses metadados externos inaplicáveis. Os contratos são travados por testes golden de JSON.
 
-## Transações SQL
+## Persistência
 
-_A preencher na Fase 2._
+Pacote `internal/adapter/postgres`, migrations em `migrations/` (embutidas no binário via `embed`).
+
+### Biblioteca e mapeamento
+
+| Aspecto | Decisão |
+|---|---|
+| Driver | `pgx/v5` com `pgxpool` e **SQL explícito** (sem ORM, sem geração de código) |
+| Migrations | `golang-migrate` com driver `pgx/v5` e fonte `iofs` (arquivos `NNNNNN_nome.up.sql` / `.down.sql`) |
+| `Money` | Duas colunas: `*_minor BIGINT` (unidades mínimas) + `currency CHAR(3)`. Reidratado com `money.New` + `money.ParseCurrency`; nunca passa por `NUMERIC`/float |
+| Payload hash | `BYTEA` com `CHECK (octet_length = 32)` |
+| Payload de outbox | Tipo `JSON` (não `JSONB`): valida o JSON e **preserva byte a byte** o snapshot serializado |
+| Timestamps | `TIMESTAMPTZ`, sessão em `timezone=UTC`, precisão de microssegundos |
+| Reidratação | Todo `SELECT` passa pelos construtores `Rehydrate*` do domínio; dado inconsistente vira `app.ErrIntegrityViolation` em vez de ser usado silenciosamente |
+
+### Delimitação da transação SQL
+
+Os ports (`internal/app/ports.go`) expõem `TxManager.WithinTx(ctx, fn)`. A implementação abre a transação, guarda o `pgx.Tx` no `context.Context` e todos os repositórios usam essa transação quando presente (ou o pool, fora dela). Assim um caso de uso compõe vários repositórios (carteira, transação, ledger, inbox, outbox) em **um único commit**, sem que os repositórios conheçam uns aos outros.
+
+- Isolamento `READ COMMITTED` para escrita (a serialização por carteira vem do lock de linha, ver [Concorrência](#concorrência)).
+- `WithinSnapshot` abre `REPEATABLE READ READ ONLY` para leituras consistentes (reconciliação).
+- `lock_timeout` e `statement_timeout` são aplicados com `set_config(..., true)` no início de cada transação (escopo local), evitando espera indefinida por locks.
+- Chamadas aninhadas a `WithinTx` reutilizam a transação externa.
+- Métodos `...ForUpdate` exigem transação ativa (`app.ErrTxRequired`); não existe lock fora de transação.
+- Rollback usa `context.WithoutCancel` com prazo próprio, para liberar a conexão mesmo quando o contexto da requisição já foi cancelado.
+
+### Classificação de erros
+
+| Origem | Erro da aplicação |
+|---|---|
+| `pgx.ErrNoRows` | `app.ErrNotFound` |
+| `23505` unique violation | `*app.ConflictError` com `Kind` derivado do nome da constraint (`WALLET_EXISTS`, `IDEMPOTENCY_KEY`, `EXTERNAL_TRANSACTION`, `REFERENCE_REVERSED`, `OPENING_EXISTS`, ...) |
+| Demais `23xxx` (check, FK, triggers) | `app.ErrIntegrityViolation` |
+| `08xxx`, `40001`, `40P01`, `55P03`, `57014`, `57P0x`, `53300`, `53400`, erros de conexão/rede | `app.ErrTransient` (retry permitido) |
+| `context.Canceled` / `DeadlineExceeded` | Propagados sem reclassificação |
+
+O erro original é preservado na cadeia (`errors.As` continua encontrando `*pgconn.PgError`).
+
+### Papéis e privilégios
+
+| Papel | Uso | Privilégios |
+|---|---|---|
+| `wallet_owner` | Dono do schema; executa migrations | Todos |
+| `wallet_app` (NOLOGIN) | Grupo de permissões da aplicação | Concedidos pelas migrations |
+| `wallet_service` (LOGIN, membro de `wallet_app`) | Usuário de runtime do serviço | Herdados de `wallet_app` |
+
+O script `deploy/postgres/init/01-create-app-user.sh` cria os papéis na inicialização do container (usuário e senha vêm de `APP_DB_USER`/`APP_DB_PASSWORD`). Privilégios concedidos a `wallet_app`, **por coluna** onde há `UPDATE`:
+
+| Tabela | SELECT | INSERT | UPDATE | DELETE |
+|---|---|---|---|---|
+| `wallets` | ✔ | ✔ | `balance_minor`, `version`, `updated_at` | ✘ |
+| `wager_transactions` | ✔ | ✔ | apenas colunas de estado/resultado/agendamento | ✘ |
+| `ledger_entries` | ✔ | ✔ | ✘ | ✘ |
+| `inbox_messages` | ✔ | ✔ | `transaction_id`, `processed_at` | ✘ |
+| `outbox_events` | ✔ | ✔ | `attempts`, `next_attempt_at`, `locked_by`, `locked_until`, `published_at`, `last_error` | ✔ (somente publicados, por trigger) |
+
+### Invariantes impostas pelo banco
+
+As regras abaixo valem **independentemente da aplicação**: um bug, um script manual ou outra instância desatualizada não consegue violá-las.
+
+| Invariante | Mecanismo |
+|---|---|
+| Saldo nunca negativo | `CHECK (balance_minor >= 0)` em `wallets`; `CHECK` de saldos no ledger |
+| Uma carteira por `(player, currency)` | `UNIQUE (player_id, currency)` |
+| Transação, lançamento e carteira com mesmo jogador/moeda | FKs compostas `(wallet_id, player_id, currency)` e `(wallet_id, currency)`; `(transaction_id, wallet_id)` no ledger |
+| Versão só muda com saldo, sempre `+1` | Trigger `wallets_guard_update` |
+| Identidade da carteira imutável | Trigger + ausência de `UPDATE` nessas colunas |
+| Toda mudança de saldo tem lançamento no mesmo commit | Constraint trigger **adiado** `wallets_check_ledger`: no commit, a última entrada do ledger precisa ter `wallet_version` e `balance_after` iguais aos da carteira |
+| Lançamento corresponde a transação `PROCESSED` com o mesmo valor, resultado e direção compatível | Constraint trigger adiado `ledger_entries_check_consistency` |
+| Transação `PROCESSED` (exceto `LOSS`) tem lançamento | Constraint trigger adiado `wager_transactions_check_ledger` |
+| `balanceAfter = balanceBefore ± amount` | `CHECK ledger_entries_arithmetic` |
+| Ledger encadeado (`before[n] = after[n−1]`) | Trigger `ledger_entries_check_chain` + `UNIQUE (wallet_id, wallet_version)` |
+| Um lançamento por transação na carteira | `UNIQUE (wallet_id, transaction_id)` |
+| Ledger append-only | Sem `UPDATE`/`DELETE` para a aplicação **e** triggers que rejeitam `UPDATE`, `DELETE` e `TRUNCATE` até para o dono |
+| Idempotência persistente | `UNIQUE (provider_id, idempotency_key)` e `UNIQUE (provider_id, external_transaction_id)` |
+| Um único crédito de abertura | Índice único parcial `(wallet_id) WHERE kind = 'OPENING'` |
+| Reversão única | Índice único parcial `(reference_transaction_id) WHERE status = 'PROCESSED' AND kind IN ('REFUND','ROLLBACK')` |
+| Formato interno × externo | `CHECK wager_transactions_internal_shape` / `external_shape` |
+| Política de valor zero | `CHECK wager_transactions_amount_policy` |
+| Dados exigidos por estado | `CHECK wager_transactions_status_shape` |
+| Máquina de estados | Trigger `wager_transactions_guard_update`: terminal é imutável, transições válidas, dados da requisição imutáveis, `expires_at` fixo, `attempts` monotônico |
+| Transações nunca apagadas | Trigger `BEFORE DELETE`/`TRUNCATE` |
+| Inbox: identidade imutável, conclusão final | PK `(consumer_name, message_id)` + trigger |
+| Outbox: snapshot imutável, publicação final, não publicados retidos | Trigger de update/delete + tipo `JSON` |
+
+Os triggers levantam `SQLSTATE 23000` com `CONSTRAINT` nomeada, então a aplicação os classifica como violação de integridade e os testes verificam **qual** regra foi acionada.
+
+### Migrations
+
+| Versão | Conteúdo |
+|---|---|
+| `000001` | Papel `wallet_app` e `USAGE` no schema |
+| `000002` | `wallets` + triggers de guarda |
+| `000003` | `wager_transactions` + índices parciais + máquina de estados |
+| `000004` | `ledger_entries` + cadeia + triggers adiados de consistência entre as três tabelas |
+| `000005` | `inbox_messages` |
+| `000006` | `outbox_events` |
+
+Toda migration tem `down` correspondente. O teste `TestMigrationsApplyRevertAndReapply` aplica tudo, reverte um passo, reverte o restante e reaplica em um banco vazio.
+
+### Testes de integração
+
+Executados contra PostgreSQL real (`postgres:18.6-alpine3.24`) via testcontainers-go, com build tag `integration`:
+
+- um container por pacote; as migrations são aplicadas uma vez num banco *template* e cada teste recebe um banco novo clonado (`CREATE DATABASE ... TEMPLATE`), permitindo testes paralelos e isolados;
+- a aplicação conecta como `wallet_service`, provando que os privilégios mínimos são suficientes;
+- cada constraint e trigger é violado diretamente por SQL, verificando o nome da regra acionada (inclusive as verificações adiadas, que falham no `COMMIT`);
+- concorrência real: claim de pendências e da outbox por vários workers sem sobreposição, entregas simultâneas na inbox, duas apostas de 80.00 sobre 100.00, lock de uma carteira sem bloquear outra, timeout de lock classificado como transitório;
+- teste de mutação manual: removendo `AND version = $old` do `UPDATE`, o teste de escrita concorrente falha e o trigger `wallets_version_follows_balance` ainda impede o lost update.
 
 ## Idempotência
 
@@ -312,7 +420,15 @@ _A preencher na Fase 3._
 
 ## Concorrência
 
-_A preencher na Fase 3._
+Coordenação **por carteira**, com três camadas independentes:
+
+1. **Lock pessimista**: o processamento abre transação e executa `SELECT ... FROM wallets WHERE id = $1 FOR UPDATE`. Operações da mesma carteira são serializadas entre quaisquer processos; carteiras diferentes não disputam lock (não há lock global nem tabela de controle).
+2. **Versão condicionada**: `UPDATE wallets ... WHERE id = $1 AND version = $loaded`. Se a linha mudou desde a leitura, nenhuma linha é afetada e o repositório devolve `app.ErrConcurrentUpdate`.
+3. **Banco como rede final**: trigger que exige `version + 1` a cada mudança de saldo, `UNIQUE (wallet_id, wallet_version)` no ledger e a verificação adiada entre carteira e ledger. Mesmo sem as camadas 1 e 2, um lost update é rejeitado no commit.
+
+Ordem de aquisição de locks: **carteira → transações** (referência e pendência). O worker de referências pendentes faz o claim em uma transação curta (`FOR UPDATE SKIP LOCKED` + lease em `next_attempt_at`) e processa cada item em transação própria respeitando a mesma ordem, evitando deadlock com o fluxo síncrono. `lock_timeout` limita a espera; o timeout é classificado como transitório.
+
+_O detalhamento do fluxo nos casos de uso será documentado na Fase 3._
 
 ## Mensageria
 
@@ -343,3 +459,6 @@ _A preencher na Fase 4._
 - **Formatos equivalentes não são aceitos**: `25`, `25.0`, UUIDs em maiúsculas e identificadores com espaços são rejeitados em vez de normalizados, eliminando ambiguidade no hash de idempotência.
 - **Reversões parciais** não são suportadas (conforme o enunciado).
 - **Reversão única por transação**: um `ROLLBACK` de `REFUND` não reabre a `BET` para nova devolução.
+- **Custo das verificações adiadas**: os constraint triggers executam algumas leituras por linha alterada no commit. É um custo deliberado em troca de integridade garantida pelo banco; em volumes muito altos poderia ser substituído por reconciliação contínua.
+- **Superusuário**: triggers protegem contra `UPDATE`/`DELETE`/`TRUNCATE` inclusive do dono do schema, mas um superusuário pode desabilitá-los (`session_replication_role`, `ALTER TABLE ... DISABLE TRIGGER`). Em produção o dono do schema não deve ser superusuário e o acesso administrativo deve ser auditado. No ambiente local o `POSTGRES_USER` do container é superusuário por conveniência.
+- **Retenção da outbox**: eventos publicados podem ser apagados (o trigger só retém os não publicados), mas o job de retenção não faz parte do escopo.
