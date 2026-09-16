@@ -12,7 +12,22 @@ var (
 	ErrTransient          = errors.New("app: transient failure")
 	ErrIntegrityViolation = errors.New("app: integrity violation")
 	ErrTxRequired         = errors.New("app: operation requires an active transaction")
+	ErrForbidden          = errors.New("app: forbidden")
+	ErrInvalidInput       = errors.New("app: invalid input")
+	ErrInboxMismatch      = errors.New("app: message id reused with a different payload")
 )
+
+type ValidationError struct {
+	Code   string
+	Field  string
+	Reason string
+}
+
+func (e *ValidationError) Error() string {
+	return fmt.Sprintf("app: %s: %s: %s", e.Code, e.Field, e.Reason)
+}
+
+func (e *ValidationError) Is(target error) bool { return target == ErrInvalidInput }
 
 type ConflictKind string
 
