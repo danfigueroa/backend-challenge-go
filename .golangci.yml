@@ -1,0 +1,64 @@
+version: "2"
+
+run:
+  build-tags:
+    - integration
+    - e2e
+    - faultinject
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - contextcheck
+    - copyloopvar
+    - errorlint
+    - exhaustive
+    - forbidigo
+    - gocritic
+    - gosec
+    - misspell
+    - nilerr
+    - noctx
+    - prealloc
+    - revive
+    - rowserrcheck
+    - sqlclosecheck
+    - unconvert
+    - unparam
+    - wrapcheck
+  settings:
+    forbidigo:
+      forbid:
+        - pattern: ^(float32|float64)$
+          msg: floating point is forbidden in this codebase; use money.Money
+        - pattern: ^strconv\.ParseFloat$
+          msg: floating point parsing is forbidden; use money.Parse
+      analyze-types: true
+    exhaustive:
+      default-signifies-exhaustive: true
+    wrapcheck:
+      ignore-package-globs:
+        - github.com/danfigueroa/backend-challenge-go/*
+  exclusions:
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - wrapcheck
+          - forbidigo
+      - path: internal/platform/(metrics|tracing)/
+        linters:
+          - forbidigo
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/danfigueroa/backend-challenge-go
