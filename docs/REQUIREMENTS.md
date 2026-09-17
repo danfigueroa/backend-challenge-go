@@ -11,10 +11,10 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | E1 | Autenticação efetiva nos endpoints de negócio | `internal/adapter/auth`, `httpapi.authenticate` | `TestAuthenticationAgainstRealKeycloak`, `TestProcessTransactionErrors` | ✅ |
 | E2 | Sem acesso não autorizado a operações/transações | Roles na borda + `app.Actor` nos casos de uso | `TestProviderIsolationOverHTTP`, `TestProviderIsolation`, `TestActorAuthorization` | ✅ |
 | E3 | Sem cálculo monetário em ponto flutuante | `internal/domain/money`; `forbidigo` | `make lint`, `FuzzParse` | 🚧 |
-| E4 | Sem saldo negativo por concorrência | Lock por carteira + `CHECK` | `TestTwoConcurrentBetsOfEightyOnHundred`, `TestDistinctWalletsAreProcessedInParallel` | 🚧 |
-| E5 | Sem movimentação duplicada | Idempotência + inbox + unicidades | `TestSameBetFiftyTimesInParallelDebitsOnce`, `TestConcurrentHTTPAndSQSForTheSameOperation` | 🚧 |
+| E4 | Sem saldo negativo por concorrência | Lock por carteira + `CHECK` | `TestTwoConcurrentBetsOfEightyOnHundred`, `TestCompetingBetsAcrossInstancesNeverOverdraw` (3 processos) | ✅ |
+| E5 | Sem movimentação duplicada | Idempotência + inbox + unicidades | `TestSameBetFiftyTimesInParallelDebitsOnce`, `TestIdenticalBetAcrossInstancesDebitsOnce`, `TestSameOperationThroughHTTPAndSQSIsAppliedOnce` | ✅ |
 | E6 | Idempotência persistente (não em memória) | `wager_transactions` (chave, hash, resultado) | `TestReplayAfterRestartUsesPersistedState` | ✅ |
-| E7 | Funciona com múltiplas instâncias | | | ⏳ |
+| E7 | Funciona com múltiplas instâncias | Estado apenas no PostgreSQL; claims com `SKIP LOCKED` + lease; compose com 3 instâncias | `test/e2e` (processos independentes), `TestComposeInstancesShareState` | ✅ |
 | E8 | Sem publicação anterior ao commit | Outbox na mesma transação; publisher lê apenas linhas confirmadas | `TestEventsSurviveCrashBetweenCommitAndPublication`, `TestAllRolesProcessSQSMessagesAndPublishEvents` | ✅ |
 | E9 | Ledger auditável | `ledger_entries` append-only, encadeado, versionado | `TestLedgerConstraints`, `TestLedgerRepository` | 🚧 |
 | E10 | PostgreSQL, SQS e IdP reais nos testes | testcontainers: PostgreSQL 18, Keycloak 26.7.4, LocalStack 4.14.0 | `*_integration_test.go` | ✅ |
@@ -39,10 +39,10 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | S1 | Versão Go declarada em `go.mod` e Dockerfile | `go.mod` (`go 1.27.1`), `Dockerfile` (`golang:1.27.1-alpine3.24`) | `docker build` | ✅ |
 | S2 | `go.mod`/`go.sum` versionados | `go.mod`, `go.sum` | `go mod verify` | ✅ |
 | S3 | Uber Fx com `fx.Module`/`fx.Provide`/`fx.Invoke` | `internal/fxapp` | `TestApplicationGraphIsValidForEveryRoleCombination` | ✅ |
-| S4 | `fx.Lifecycle`: validação no start, workers canceláveis, shutdown ordenado | `internal/fxapp`, `internal/worker`, `internal/platform/httpserver` | `TestApplicationStartsServesAndStopsCleanly`, `TestRunner*`, `TestServerLifecycleCompletesInFlightRequests` | 🚧 |
+| S4 | `fx.Lifecycle`: validação no start, workers canceláveis, shutdown ordenado | `internal/fxapp`, `internal/worker`, `internal/platform/httpserver` | `TestApplicationStartsServesAndStopsCleanly`, `TestRunner*`, `TestServerLifecycleCompletesInFlightRequests`, `TestGracefulShutdownCompletesAndRestartPreservesIdempotency` | ✅ |
 | S5 | Domínio independente de Fx/HTTP/SQS/persistência | `internal/domain` (depende só da stdlib e `google/uuid`) | `go list -deps ./internal/domain/...` | ✅ |
 | S6 | Migrations versionadas com up/down documentados | `migrations/`, `wallet migrate up|down|version`, README | `TestMigrationsApplyRevertAndReapply` | ✅ |
-| S7 | Docker Compose | | | ⏳ |
+| S7 | Docker Compose | `docker-compose.yml`: PostgreSQL, migrate, Keycloak, LocalStack, `app-1..3`, Jaeger, Prometheus, Grafana | `docker compose up --build --wait`, `TestComposeInstancesShareState` | ✅ |
 
 ## Domínio (§6, §7)
 
@@ -58,7 +58,7 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | D8 | Regras BET/WIN/LOSS/REFUND/ROLLBACK e política de zero | `wagering/processor.go`, `request.go` | `TestProcess*`, `TestZeroAmountPolicy`, `TestReferenceRules` | ✅ |
 | D9 | Reversão única e combinação REFUND/ROLLBACK | Domínio `AlreadyReversed` + índice `wager_transactions_single_reversal` | `TestRefundAndRollbackCombinations`, `TestReversalUniquenessIsEnforcedByTheDatabase` | ✅ |
 | D10 | Reversão sem saldo com código distinto | `REVERSAL_INSUFFICIENT_FUNDS` | `TestReversalInsufficientFundsUsesDistinctCode` | ✅ |
-| D11 | `PENDING_REFERENCE` com backoff, limite e rejeição por expiração | `PendingPolicy`, `ResolveDuePending` (loop do worker na Fase 6) | `TestReversalArrivingBeforeReferenceIsResolvedLater`, `TestPendingReferenceExpiresWithRejection` | 🚧 |
+| D11 | `PENDING_REFERENCE` com backoff, limite e rejeição por expiração | `PendingPolicy`, `ResolveDuePending`, `internal/worker/pendingref` | `TestReversalArrivingBeforeReferenceIsResolvedLater`, `TestPendingReferenceExpiresWithRejection`, `TestPendingReferenceExpiresWhenReferenceNeverArrives` | ✅ |
 | D12 | `failureCode` estáveis e documentados | `wagering/failure_code.go`; ARCHITECTURE › Códigos de falha | `TestParsers`, `TestNewRequestValidation` | ✅ |
 | D13 | Inbox e outbox | Tabelas, repositórios, consumidor e publisher | `TestInboxRepository`, `TestOutboxRepository`, `sqsconsumer`/`outboxpub` integration tests | ✅ |
 
@@ -72,7 +72,7 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | H4 | `GET /wagering/transactions/:id` | `httpapi.getTransaction` | `TestTransactionQueries`, `TestProviderIsolationOverHTTP` | ✅ |
 | H5 | `GET /providers/:providerId/wagering/transactions/:externalId` | `httpapi.getByExternalID` | `TestTransactionQueries`, `TestProviderIsolationOverHTTP` | ✅ |
 | H6 | `POST /wagering/transactions` com `Idempotency-Key` obrigatório | `httpapi.processTransaction` | `TestProcessTransactionErrors/missing_idempotency_key`, `TestHTTPContractEndToEnd` | ✅ |
-| H7 | Hash canônico e equivalência HTTP/SQS | `wagering.NewRequest` usado pelas duas portas | `TestCanonicalPayloadGolden`, `TestSQSDeliveriesAreDeduplicatedByInboxAndIdempotency` | 🚧 |
+| H7 | Hash canônico e equivalência HTTP/SQS | `wagering.NewRequest` usado pelas duas portas | `TestCanonicalPayloadGolden`, `TestSQSDeliveriesAreDeduplicatedByInboxAndIdempotency`, `TestSameOperationThroughHTTPAndSQSIsAppliedOnce` | ✅ |
 | H8 | Replay devolve saldo original com `idempotentReplay: true` | Resultado persistido | `TestBetIsProcessedAndReplayReturnsOriginalBalance`, `TestHTTPContractEndToEnd` | ✅ |
 | H9 | Conflitos de chave e de `(providerId, externalTransactionId)` | `IdempotencyConflictError` → 409 | `TestIdempotencyConflicts`, `TestHTTPContractEndToEnd` | ✅ |
 | H10 | Códigos HTTP distinguíveis documentados | ARCHITECTURE › Contrato HTTP | `TestProcessTransactionResponses`, `TestProcessTransactionErrors` | ✅ |
@@ -117,16 +117,16 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | T3 | Integração: inbox, reentrega, outbox concorrente, retry, DLQ, reinício | `sqsconsumer` e `outboxpub` integration tests (LocalStack real) | ✅ |
 | T4 | Composição Fx: start/stop e liberação de recursos | `TestApplicationStartsServesAndStopsCleanly` (goleak), `TestApplicationFailsToStartWithoutDatabase` | ✅ |
 | T5 | Auth: credenciais ausentes/inválidas/expiradas; isolamento; sem efeitos | `TestAuthenticationAgainstRealKeycloak`, `TestProviderIsolationOverHTTP` (Keycloak real), `auth_test.go` | ✅ |
-| T6 | Mesma aposta 50× em paralelo → um débito | `TestSameBetFiftyTimesInParallelDebitsOnce`, `TestConcurrentHTTPRequests` (multi-processo na Fase 7) | 🚧 |
-| T7 | Duas apostas de 80.00 sobre 100.00 | `TestTwoConcurrentBetsOfEightyOnHundred`, `TestConcurrentBetsOnSameWalletAtRepositoryLevel` (multi-processo na Fase 7) | 🚧 |
-| T8 | Carteiras distintas em paralelo | `TestDistinctWalletsAreProcessedInParallel`, `TestSameWalletSerializesAndDistinctWalletsProceedInParallel` | 🚧 |
-| T9 | Três instâncias independentes | | ⏳ |
-| T10 | Consumer interrompido após commit e antes do delete | `TestCrashAfterCommitBeforeDeleteIsRedeliveredSafely` (processo real na Fase 7) | 🚧 |
-| T11 | Dois publishers disputando a outbox | `TestConcurrentPublishersPublishEachEventOnce`, `TestRecoveryBetweenPublicationAndConfirmationKeepsEventID` (processos reais na Fase 7) | 🚧 |
-| T12 | Reversão antes da referência: resolução e expiração | `TestReversalArrivingBeforeReferenceIsResolvedLater`, `TestPendingReferenceExpiresWithRejection` | 🚧 |
-| T13 | Reinício preserva idempotência, pendências e consistência | `TestReplayAfterRestartUsesPersistedState`, `TestPendingSurvivesRestartAndIsResumedByAnotherInstance` (processos reais na Fase 7) | 🚧 |
-| T14 | Cenários cruzando HTTP e SQS | `TestSameOperationThroughHTTPAndSQS` (SQS real), `TestConcurrentHTTPAndSQSForTheSameOperation` | 🚧 |
-| T15 | Reconciliação final saldo × ledger | `apptest.AssertAllWalletsReconcile` ao final dos cenários | 🚧 |
+| T6 | Mesma aposta 50× em paralelo → um débito | `TestSameBetFiftyTimesInParallelDebitsOnce`, `TestIdenticalBetAcrossInstancesDebitsOnce` (3 processos) | ✅ |
+| T7 | Duas apostas de 80.00 sobre 100.00 | `TestTwoConcurrentBetsOfEightyOnHundred`, `TestCompetingBetsAcrossInstancesNeverOverdraw` (3 processos) | ✅ |
+| T8 | Carteiras distintas em paralelo | `TestSameWalletSerializesAndDistinctWalletsProceedInParallel`, `TestManyWalletsUnderConcurrentLoadStayConsistent` (3 processos) | ✅ |
+| T9 | Três instâncias independentes | `test/e2e` (processos do SO), `docker-compose.yml` (`app-1..3`), `TestComposeInstancesShareState` | ✅ |
+| T10 | Consumer interrompido após commit e antes do delete | `TestCrashAfterCommitBeforeDeleteIsRedeliveredSafely`, `TestConsumerCrashAfterCommitBeforeDeleteIsRedeliveredWithoutDoubleDebit` (`FAULT_CRASH_POINT`) | ✅ |
+| T11 | Dois publishers disputando a outbox | `TestConcurrentPublishersPublishEachEventOnce`, `TestPublisherCrashBetweenPublishAndConfirmRepublishesSameEventID` (crash real + 2 processos) | ✅ |
+| T12 | Reversão antes da referência: resolução e expiração | `TestReversalArrivingBeforeReferenceIsResolvedLater`, `TestPendingReferenceExpiresWithRejection`, `TestPendingReferenceSurvivesKillAndIsResolvedByAnotherInstance`, `TestPendingReferenceExpiresWhenReferenceNeverArrives` | ✅ |
+| T13 | Reinício preserva idempotência, pendências e consistência | `TestReplayAfterRestartUsesPersistedState`, `TestKillDuringConcurrentLoadWithClientRetries`, `TestGracefulShutdownCompletesAndRestartPreservesIdempotency`, `TestPendingReferenceSurvivesKillAndIsResolvedByAnotherInstance` | ✅ |
+| T14 | Cenários cruzando HTTP e SQS | `TestConcurrentHTTPAndSQSForTheSameOperation`, `TestSameOperationThroughHTTPAndSQSIsAppliedOnce` (processos reais) | ✅ |
+| T15 | Reconciliação final saldo × ledger | `apptest.AssertAllWalletsReconcile` (integração) e `assertFinancialConsistency` ao final de todo cenário e2e | ✅ |
 | T16 | Teste de carga k6 (opcional) | | ⏳ |
 
 ## Entrega (§15)
@@ -136,6 +136,6 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | X1 | `README.md` completo | ⏳ |
 | X2 | `ARCHITECTURE.md` com todas as decisões e limitações | ⏳ |
 | X3 | `.env.example` | 🚧 |
-| X4 | `docker compose up --build`, `go test ./...`, `go test -race ./...`, `go vet ./...` | ⏳ |
-| X5 | Instruções de integração, multi-instância e falhas | ⏳ |
-| X6 | Código formatado com `gofmt` | ⏳ |
+| X4 | `docker compose up --build`, `go test ./...`, `go test -race ./...`, `go vet ./...` | 🚧 |
+| X5 | Instruções de integração, multi-instância e falhas | ✅ |
+| X6 | Código formatado com `gofmt` | ✅ |
