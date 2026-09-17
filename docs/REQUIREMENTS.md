@@ -25,7 +25,7 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 |---|---|---|---|---|
 | G1 | Dinheiro sem `float32`/`float64` | `int64` em `money`; `forbidigo` no `.golangci.yml` | `make lint` | 🚧 |
 | G2 | Idempotência persistente e resistente a reinício | Chave + hash + resultado persistidos | `TestReplayAfterRestartUsesPersistedState`, `TestPendingSurvivesRestartAndIsResumedByAnotherInstance` | ✅ |
-| G3 | Invariantes financeiras garantidas no banco | Migrations `000002`–`000004` (constraints, triggers, constraint triggers adiados) | `TestWalletConstraints`, `TestLedgerConstraints`, `TestTransactionConstraints` | ✅ |
+| G3 | Invariantes financeiras garantidas no banco | Migrations `000002`–`000004` e `000007` (constraints, triggers, constraint triggers adiados com buscas indexadas) | `TestWalletConstraints`, `TestLedgerConstraints`, `TestTransactionConstraints`, `TestIntegrityTriggersReadLedgerByIndexedLookups` | ✅ |
 | G4 | Publicação só após commit | Transactional outbox + publisher separado | `outboxpub` integration tests | ✅ |
 | G5 | Ledger append-only | Grants sem `UPDATE`/`DELETE` + triggers `ledger_entries_append_only` | `TestLedgerConstraints/append_only_*` | ✅ |
 | G6 | Carteiras independentes em paralelo; sem lock global | Lock de linha por carteira | `TestSameWalletSerializesAndDistinctWalletsProceedInParallel` | 🚧 |
@@ -94,7 +94,7 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | M4 | Retry com backoff; DLQ para permanentes/esgotados | Visibilidade com backoff + redrive; DLQ explícita com motivo | `TestTransientFailuresAreRetriedThenRedriven`, `TestPermanentFailuresAreDeadLettered` | ✅ |
 | M5 | Shutdown: para de buscar, conclui ou libera visibilidade | `Consumer.release` | `TestShutdownCompletesInFlightAndReleasesTheRest` | ✅ |
 | M6 | `MessageGroupId`/`MessageDeduplicationId` documentados | ARCHITECTURE › Consumidor SQS / Contrato de roteamento | `TestConcurrentHTTPAndSQSForTheSameOperation` | ✅ |
-| M7 | Outbox publisher com múltiplas instâncias, lease e backoff | `internal/worker/outboxpub` | `TestConcurrentPublishersPublishEachEventOnce`, `TestFailedPublicationIsRetriedWithBackoff`, `TestShutdownReleasesClaimedEvents` | ✅ |
+| M7 | Outbox publisher com múltiplas instâncias, lease e backoff | `internal/worker/outboxpub` (publicação paralela por carteira) | `TestConcurrentPublishersPublishEachEventOnce`, `TestFailedPublicationIsRetriedWithBackoff`, `TestShutdownReleasesClaimedEvents`, `TestPartitionsArePublishedConcurrentlyInOrder`, `TestFailedPublicationPostponesOnlyItsPartition` | ✅ |
 | M8 | Republicação preserva `eventId` | `MessageDeduplicationId = eventId` | `TestRecoveryBetweenPublicationAndConfirmationKeepsEventID` | ✅ |
 | M9 | Quatro eventos com envelope tipado | `internal/domain/event` | `events_test.go` (golden JSON) | ✅ |
 | M10 | Destino dos eventos provisionado e documentado | SNS FIFO `wallet-events.fifo` → `wallet-events-audit.fifo` | `TestProvisionedMessagingTopology`, `TestAllRolesProcessSQSMessagesAndPublishEvents` | ✅ |
@@ -106,7 +106,7 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | O1 | Logs JSON com identificadores de rastreio, sem dados sensíveis | `internal/platform/logging` | `logging_test.go` | ✅ |
 | O2 | Métricas: status, duplicatas, retries, DLQ, conflitos, atraso outbox, latência, divergências | `internal/platform/metrics` + instrumentação de consumidor e publisher | `metrics_test.go`, `TestAllRolesProcessSQSMessagesAndPublishEvents` | ✅ |
 | O3 | Tracing OpenTelemetry (opcional) | `otelpgx`, `otelhttp`, `otelaws`, propagação `traceparent` via atributos SQS | `tracing_test.go` | ✅ |
-| O4 | Dashboard Grafana (opcional) | | | ⏳ |
+| O4 | Dashboard Grafana (opcional) | `deploy/grafana/dashboards/wallet-service.json` provisionado | `docker compose up`, Grafana › Wallet › Wallet Service | ✅ |
 
 ## Verificação (§13)
 
@@ -127,7 +127,7 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | T13 | Reinício preserva idempotência, pendências e consistência | `TestReplayAfterRestartUsesPersistedState`, `TestKillDuringConcurrentLoadWithClientRetries`, `TestGracefulShutdownCompletesAndRestartPreservesIdempotency`, `TestPendingReferenceSurvivesKillAndIsResolvedByAnotherInstance` | ✅ |
 | T14 | Cenários cruzando HTTP e SQS | `TestConcurrentHTTPAndSQSForTheSameOperation`, `TestSameOperationThroughHTTPAndSQSIsAppliedOnce` (processos reais) | ✅ |
 | T15 | Reconciliação final saldo × ledger | `apptest.AssertAllWalletsReconcile` (integração) e `assertFinancialConsistency` ao final de todo cenário e2e | ✅ |
-| T16 | Teste de carga k6 (opcional) | | ⏳ |
+| T16 | Teste de carga k6 (opcional) | `test/load/wagering.js`, `make load`, [LOAD_TEST.md](LOAD_TEST.md) | ✅ |
 
 ## Entrega (§15)
 
