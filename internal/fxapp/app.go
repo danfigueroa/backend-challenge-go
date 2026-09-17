@@ -39,6 +39,7 @@ func Options(cfg config.Config, extra ...fx.Option) fx.Option {
 	if cfg.App.HasRole(config.RolePendingRef) {
 		options = append(options, PendingReferenceModule)
 	}
+	options = append(options, faultInjection)
 	options = append(options, extra...)
 	options = append(options, fx.Invoke(registerDrain))
 	return fx.Options(options...)
