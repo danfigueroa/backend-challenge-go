@@ -1014,4 +1014,3 @@ Resumo do teste de carga com toda a stack em um MacBook de 8 núcleos: ~790 req/
 - **Ledger de partidas dobradas** (opcional no enunciado): o ledger é de partida simples por carteira.
 - **Rate limiting** e cotas por provedor na API.
 - **Aceite assíncrono**: não utilizado (ver [Máquina de estados](#máquina-de-estados)).
-- **Pipeline de CI**: o workflow está versionado, mas as execuções documentadas foram feitas localmente.
