@@ -34,7 +34,9 @@ Regra de dependência: `domain` ← `app` ← `adapter`/`worker` ← `fxapp` ←
 | Composição | Uber Fx com módulos por camada e papéis por instância (`APP_ROLES`) | [Uso do Fx e shutdown](#uso-do-fx-e-shutdown) |
 | Observabilidade | `slog` JSON com campos de contexto, Prometheus em porta administrativa, OpenTelemetry opcional | [Observabilidade](#observabilidade) |
 | Invariantes | Constraints, FKs compostas, índices parciais, triggers e constraint triggers adiados; aplicação sem `UPDATE`/`DELETE` no ledger | [Invariantes impostas pelo banco](#invariantes-impostas-pelo-banco) |
-| Mensageria local | LocalStack `4.14.0` community | [Mensageria](#mensageria) |
+| Mensageria local | LocalStack `4.14.0` community, provisionamento automático | [Mensageria](#mensageria) |
+| Consumidor SQS | Delete só após commit, inbox na mesma transação, DLQ explícita para permanentes e redrive para esgotados, visibilidade liberada no shutdown | [Consumidor SQS](#consumidor-sqs) |
+| Outbox | Claim com `SKIP LOCKED` + lease, SNS FIFO com dedup por `eventId`, backoff exponencial | [Publicação com transactional outbox](#publicação-com-transactional-outbox) |
 | Reversões | Cada transação revertida no máximo uma vez | [Reversões](#reversões) |
 | Referências pendentes | TTL (padrão 30 min) + backoff exponencial com jitter; `WIN` com referência também aguarda | [Referências](#referências) |
 | Validação de carteira | Carteira inexistente/de outro jogador/outra moeda é erro corrigível, não persistido | [Serviço de domínio](#serviço-de-domínio-process) |
@@ -559,7 +561,98 @@ As imagens `localstack/localstack` publicadas a partir de 2026 (`2026.x`, `lates
 - SQS FIFO com `RedrivePolicy` movendo a mensagem para a DLQ ao exceder `maxReceiveCount`;
 - SNS FIFO (`wallet-events.fifo`) com assinatura `RawMessageDelivery` em fila SQS FIFO e deduplicação por `MessageDeduplicationId` (publicação repetida entregue uma única vez).
 
-_Inbox, outbox e consumidor serão detalhados na Fase 6._
+### Topologia provisionada
+
+Script `deploy/localstack/init/ready.d/01-provision-messaging.sh`, executado automaticamente quando o LocalStack fica pronto (o mesmo script é usado nos testes de integração):
+
+| Recurso | Configuração |
+|---|---|
+| `wager-transactions.fifo` | Entrada. FIFO, deduplicação explícita, `VisibilityTimeout=30s`, long polling de 20 s, retenção de 4 dias, `RedrivePolicy` → DLQ com `maxReceiveCount=5` |
+| `wager-transactions-dlq.fifo` | DLQ. FIFO, retenção de 14 dias, `RedriveAllowPolicy` restrita à fila de entrada |
+| `wallet-events.fifo` (SNS) | Destino dos eventos de integração. FIFO, deduplicação explícita por `eventId` |
+| `wallet-events-audit.fifo` | Assinante de exemplo do tópico (entrega raw), com política que só aceita mensagens do tópico |
+
+### Credenciais e políticas do broker
+
+Cada componente usa credenciais próprias (`SQS_CONSUMER_*`, `SNS_PUBLISHER_*`) e o provisionamento cria identidades IAM com políticas de menor privilégio (`deploy/localstack/policies/`):
+
+| Identidade | Permissões |
+|---|---|
+| `wager-transactions-producer` | `sqs:SendMessage` na fila de entrada |
+| `wager-transactions-consumer` | `ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility` na entrada; `SendMessage` na DLQ |
+| `wallet-events-publisher` | `sns:Publish` no tópico de eventos |
+
+A fila de entrada também recebe uma política de recurso que só autoriza o produtor a enviar e o consumidor a consumir.
+
+**Limitação**: a edição community do LocalStack **não aplica** IAM nem políticas de recurso, que são apenas registradas. Em AWS real, a mesma configuração passa a ser efetiva. As validações de domínio no consumidor independem disso: o provedor da mensagem passa por `wagering.NewRequest`, carteira e jogador precisam coincidir, e a idempotência é por `(providerId, chave)`.
+
+### Consumidor SQS
+
+`internal/adapter/sqsconsumer`, papel `consumer`.
+
+**Contrato da mensagem**: envelope `{messageId, type: "WagerTransactionRequested", occurredAt, data}`, decodificado com as mesmas regras estritas do HTTP (campos desconhecidos e `amount` numérico são rejeitados). O `data` passa pelo mesmo `wagering.NewRequest`, então HTTP e SQS têm validação e hash idênticos.
+
+**Atributos de envio esperados**:
+
+| Atributo | Valor | Motivo |
+|---|---|---|
+| `MessageGroupId` | `walletId` | Ordena as operações de uma mesma carteira e permite paralelismo entre carteiras |
+| `MessageDeduplicationId` | `messageId` do envelope | Deduplicação do SQS na janela de 5 minutos; a inbox cobre qualquer reentrega fora dessa janela |
+| `correlationId` (message attribute, opcional) | ID de correlação | Propagado para logs e eventos; sem ele, usa-se o `messageId` |
+| `traceparent` (opcional) | W3C trace context | Continuação do trace |
+
+**Identidade e hash da entrega**: a inbox usa `(consumerName, messageId)`. O hash da entrega é `SHA-256(type ‖ idempotencyKey ‖ JSON canônico do payload)`; `occurredAt` e formatação são ignorados. Reentrega com o mesmo hash é respondida da inbox (`DUPLICATE_DELIVERY`); o mesmo `messageId` com outro conteúdo é permanente e vai para a DLQ.
+
+**Tratamento por resultado**:
+
+| Resultado | Ação | Métrica `wallet_sqs_messages_total{result}` |
+|---|---|---|
+| Processada, rejeitada (`REJECTED`) ou pendente (`PENDING_REFERENCE`) | Commit e depois `DeleteMessage` | `PROCESSED` / `REJECTED` / `PENDING_REFERENCE` |
+| Replay de operação já feita por HTTP ou por outra mensagem | Commit do registro na inbox, depois delete | `IDEMPOTENT_REPLAY` |
+| Reentrega do mesmo `messageId` | Delete | `DUPLICATE_DELIVERY` |
+| JSON malformado, envelope inválido | Envio explícito à DLQ e delete | `DEAD_LETTERED` (`reason=MALFORMED_MESSAGE`) |
+| Erro de validação (inclusive `WALLET_NOT_FOUND`), conflito de idempotência, `messageId` reutilizado, provedor não autorizado | Envio explícito à DLQ e delete | `DEAD_LETTERED` (`VALIDATION_FAILED`, `IDEMPOTENCY_CONFLICT`, `MESSAGE_ID_REUSED`, `FORBIDDEN`) |
+| Falha transitória ou inesperada (banco fora, timeout, integridade) | `ChangeMessageVisibility` com backoff `min(2s × 2^(n−1), 60s)` pelo `ApproximateReceiveCount`; após 5 recebimentos o **redrive** leva à DLQ | `RETRY` |
+
+Mensagens enviadas explicitamente à DLQ levam os atributos `dlqReason`, `dlqErrorCode`, `dlqDetail` (até 256 caracteres), `dlqReceiveCount` e `dlqSourceQueue`, com o corpo original intacto. Mensagens que chegam por redrive não têm esses atributos, o que distingue "tentativas esgotadas" de "erro permanente".
+
+**Garantia de remoção após commit**: o delete só acontece depois que `wageringapp.Process` retorna, e esse retorno implica que a transação SQL (inbox + domínio + ledger + outbox) foi confirmada. Uma queda entre o commit e o delete gera reentrega, que é respondida da inbox sem novo efeito financeiro (`TestCrashAfterCommitBeforeDeleteIsRedeliveredSafely`).
+
+**Concorrência**: `SQS_CONSUMER_WORKERS` loops de long polling por instância, cada um processando o lote recebido em sequência. O FIFO não entrega em paralelo mensagens do mesmo grupo (carteira), e o lock de linha da carteira protege contra concorrência com HTTP e outras instâncias.
+
+**Limites e timeouts**: `SQS_PROCESSING_TIMEOUT` (10 s) é menor que o `VisibilityTimeout` da fila (30 s), então uma mensagem não fica visível enquanto é processada. O processamento usa um contexto desacoplado do cancelamento do worker, com esse timeout.
+
+**Shutdown (`SIGTERM`)**: o contexto dos loops é cancelado e o long polling em andamento retorna. A mensagem em processamento termina normalmente, e as demais mensagens do lote recebem `ChangeMessageVisibility=0`, ficando disponíveis imediatamente para outra instância (`TestShutdownCompletesInFlightAndReleasesTheRest`).
+
+### Publicação com transactional outbox
+
+`internal/worker/outboxpub`, papel `outbox`.
+
+1. **Claim**: um único `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)` reserva até `OUTBOX_BATCH_SIZE` eventos vencidos, gravando `locked_by = APP_INSTANCE_ID`, `locked_until = now + OUTBOX_LEASE` e `attempts + 1`. Vários publishers disputam a tabela sem pegar o mesmo evento.
+2. **Publicação** no SNS FIFO, com payload igual ao snapshot gravado (byte a byte), `MessageGroupId = partitionKey` (carteira), `MessageDeduplicationId = eventId` e atributos `eventType`, `eventId`, `partitionKey`.
+3. **Confirmação**: `published_at` é gravado só se o evento ainda pertence ao mesmo publisher.
+4. **Falha**: `next_attempt_at = now + min(1s × 2^(attempts−1), 5min)`, `last_error` preenchido e lock liberado.
+5. **Trabalho abandonado**: se o processo morre com eventos reservados, o lease expira e outra instância os assume.
+6. **Shutdown**: eventos reservados e ainda não publicados são liberados imediatamente (`next_attempt_at = now`).
+
+**Recuperações demonstradas**:
+
+| Interrupção | Comportamento | Teste |
+|---|---|---|
+| Entre o commit e a publicação | Eventos continuam pendentes no banco e são publicados por outra instância ou após reinício | `TestEventsSurviveCrashBetweenCommitAndPublication` |
+| Entre a publicação e a confirmação | Após o lease, outra instância republica **com o mesmo `eventId`**; o SNS FIFO descarta a duplicata e o assinante recebe uma única vez | `TestRecoveryBetweenPublicationAndConfirmationKeepsEventID` |
+| Publishers concorrentes | 3 publishers, 40 eventos: cada um publicado exatamente uma vez | `TestConcurrentPublishersPublishEachEventOnce` |
+| SNS indisponível | Backoff, `attempts` e `last_error` registrados; publica quando o prazo vence | `TestFailedPublicationIsRetriedWithBackoff` |
+
+Nenhum evento é publicado antes do commit, porque o publisher só enxerga linhas já confirmadas da `outbox_events`.
+
+### Contrato de roteamento e consumo dos eventos
+
+- **Destino**: tópico SNS FIFO `wallet-events.fifo`. Consumidores assinam com filas SQS FIFO (exemplo provisionado: `wallet-events-audit.fifo`, entrega raw).
+- **Corpo**: o envelope JSON descrito em [Eventos de integração](#eventos-de-integração).
+- **Atributos**: `eventType` (permite filter policies por tipo), `eventId`, `partitionKey`.
+- **Ordenação**: por carteira (`MessageGroupId = walletId`). Após retries, eventos da mesma carteira podem chegar fora da ordem de ocorrência; consumidores que precisam de ordem usam `walletVersion` (`WalletBalanceChanged`) e `occurredAt`.
+- **Entrega**: *at-least-once*. O SNS FIFO deduplica republicações dentro de 5 minutos; fora dessa janela, consumidores devem deduplicar por `eventId`, que é estável.
 
 ## Autenticação e autorização
 
@@ -701,6 +794,8 @@ Pacote `internal/fxapp`. O binário `cmd/wallet` carrega e valida a configuraç�
 | `application` | `app.Clock`, `app.IDGenerator`, `*walletapp.Service`, `*wageringapp.Service` | — |
 | `api` (papel `api`) | `*auth.Verifier`, servidor HTTP da API pública | `OnStart`: `net.Listen` síncrono; `OnStop`: `Shutdown` aguardando requisições em andamento |
 | `admin` | servidor HTTP administrativo (`/metrics`, `/health/live`, `/health/ready`) | `OnStart`: `net.Listen` síncrono (falha rápido); `OnStop`: `Shutdown` gracioso |
+| `sqs-consumer` (papel `consumer`) | cliente SQS (credenciais do consumidor), `worker.Runner` do consumidor | `OnStart`: verifica fila e DLQ com retry, inicia os loops; `OnStop`: para de buscar, conclui ou libera mensagens; fecha conexões ociosas |
+| `outbox-publisher` (papel `outbox`) | cliente SNS (credenciais do publisher), `worker.Runner` do publisher | `OnStart`: verifica o tópico com retry; `OnStop`: libera eventos reservados; fecha conexões ociosas |
 | `pending-references` (papel `pendingref`) | `worker.Runner` do resolvedor | `OnStart`: inicia o loop; `OnStop`: cancela e aguarda término com prazo |
 
 `fx.Invoke` registra os health checks, o collector da outbox e força a construção dos componentes com ciclo de vida. Construtores não fazem I/O: o pool é criado de forma preguiçosa e a validação da dependência acontece no `OnStart`.
@@ -726,6 +821,7 @@ stop:   drain (readiness = DOWN) → workers → servidor API → servidor admin
 - `TestApplicationGraphIsValidForEveryRoleCombination`: `fx.ValidateApp` para todas as combinações de papéis, sem I/O.
 - `TestApplicationStartsServesAndStopsCleanly` (integração, Postgres real): sobe a aplicação, verifica health e métricas, espera o worker resolver uma pendência em background, para a aplicação e confirma readiness em drain, pool fechado, servidor sem aceitar conexões e **nenhuma goroutine vazada** (`goleak`).
 - `TestApplicationFailsToStartWithoutDatabase`: start falha dentro do prazo se o banco não responde.
+- `TestAllRolesProcessSQSMessagesAndPublishEvents` (Postgres + LocalStack reais): com todos os papéis, uma mensagem na fila provisionada é consumida, o saldo é debitado, os eventos são publicados no SNS e chegam à fila assinante; readiness inclui `sqs` e `sns`; métricas refletem o fluxo; o shutdown fecha as conexões HTTP dos clientes AWS e passa no `goleak` em modo estrito (o teste revelou conexões keep-alive que ficavam abertas).
 
 ### CLI
 
@@ -784,7 +880,7 @@ OpenTelemetry com exportador OTLP/HTTP (`OTEL_TRACES_ENABLED=true`), propagaçã
 | Endpoint | Semântica |
 |---|---|
 | `GET /health/live` | processo ativo (sempre `200` enquanto o servidor responde) |
-| `GET /health/ready` | `200` se todas as dependências respondem (PostgreSQL agora, SQS na Fase 6); `503` com detalhe por dependência caso contrário, ou durante o drain do shutdown |
+| `GET /health/ready` | `200` se todas as dependências da instância respondem: PostgreSQL sempre, `sqs` (fila de entrada) no papel `consumer`, `sns` (tópico) no papel `outbox`. `503` com detalhe por dependência caso contrário, ou durante o drain do shutdown |
 
 Os checks rodam em paralelo, com timeout individual (`DATABASE_HEALTH_TIMEOUT`) e cache de 1 s para que probes frequentes não sobrecarreguem o banco. Os endpoints são expostos na API pública (sem autenticação) e no servidor administrativo.
 
@@ -799,4 +895,6 @@ Os checks rodam em paralelo, com timeout individual (`DATABASE_HEALTH_TIMEOUT`) 
 - **Tokens de provedor com roles de carteira** são tratados como provedor (menor privilégio). Revogação imediata de tokens não é suportada: a validação é local via JWKS, e a expiração curta limita a janela.
 - **Readiness não inclui o Keycloak**: o enunciado pede PostgreSQL e SQS. A indisponibilidade do IdP aparece como 503 nas requisições autenticadas.
 - **Aleatoriedade**: `math/rand/v2` é usado apenas para jitter de backoff; por isso a regra G404 do gosec está desabilitada. Identificadores usam UUIDv7 (`crypto/rand`).
+- **IAM no LocalStack**: identidades, políticas e políticas de recurso são provisionadas, mas não aplicadas pela edição community (ver [Credenciais e políticas do broker](#credenciais-e-políticas-do-broker)).
+- **Ordem de eventos após retry**: garantida por carteira apenas enquanto não há falhas de publicação; consumidores usam `walletVersion`.
 - **Retenção da outbox**: eventos publicados podem ser apagados (o trigger só retém os não publicados), mas o job de retenção não faz parte do escopo.
