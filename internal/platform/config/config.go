@@ -32,6 +32,9 @@ type Config struct {
 	Pending  Pending
 	Tracing  Tracing
 	Auth     Auth
+	AWS      AWS
+	Consumer Consumer
+	Outbox   Outbox
 }
 
 type App struct {
@@ -82,6 +85,40 @@ type Pending struct {
 	BatchSize    int           `env:"PENDING_BATCH_SIZE" envDefault:"50"`
 	ErrorBackoff time.Duration `env:"PENDING_ERROR_BACKOFF" envDefault:"30s"`
 	Iteration    time.Duration `env:"PENDING_ITERATION_TIMEOUT" envDefault:"20s"`
+}
+
+type AWS struct {
+	Region                   string        `env:"AWS_REGION" envDefault:"us-east-1"`
+	EndpointURL              string        `env:"AWS_ENDPOINT_URL"`
+	ConsumerAccessKeyID      string        `env:"SQS_CONSUMER_ACCESS_KEY_ID"`
+	ConsumerSecretAccessKey  string        `env:"SQS_CONSUMER_SECRET_ACCESS_KEY"`
+	PublisherAccessKeyID     string        `env:"SNS_PUBLISHER_ACCESS_KEY_ID"`
+	PublisherSecretAccessKey string        `env:"SNS_PUBLISHER_SECRET_ACCESS_KEY"`
+	HealthTimeout            time.Duration `env:"AWS_HEALTH_TIMEOUT" envDefault:"2s"`
+}
+
+type Consumer struct {
+	Name              string        `env:"SQS_CONSUMER_NAME" envDefault:"wager-transactions-consumer"`
+	QueueURL          string        `env:"SQS_INPUT_QUEUE_URL"`
+	DeadLetterURL     string        `env:"SQS_DLQ_URL"`
+	Workers           int           `env:"SQS_CONSUMER_WORKERS" envDefault:"4"`
+	MaxMessages       int32         `env:"SQS_MAX_MESSAGES" envDefault:"10"`
+	WaitTime          time.Duration `env:"SQS_WAIT_TIME" envDefault:"20s"`
+	ProcessingTimeout time.Duration `env:"SQS_PROCESSING_TIMEOUT" envDefault:"10s"`
+	RetryBaseDelay    time.Duration `env:"SQS_RETRY_BASE_DELAY" envDefault:"2s"`
+	RetryMaxDelay     time.Duration `env:"SQS_RETRY_MAX_DELAY" envDefault:"60s"`
+	ErrorBackoff      time.Duration `env:"SQS_ERROR_BACKOFF" envDefault:"5s"`
+}
+
+type Outbox struct {
+	TopicARN       string        `env:"SNS_EVENTS_TOPIC_ARN"`
+	PollInterval   time.Duration `env:"OUTBOX_POLL_INTERVAL" envDefault:"500ms"`
+	BatchSize      int           `env:"OUTBOX_BATCH_SIZE" envDefault:"50"`
+	Lease          time.Duration `env:"OUTBOX_LEASE" envDefault:"30s"`
+	PublishTimeout time.Duration `env:"OUTBOX_PUBLISH_TIMEOUT" envDefault:"5s"`
+	RetryBaseDelay time.Duration `env:"OUTBOX_RETRY_BASE_DELAY" envDefault:"1s"`
+	RetryMaxDelay  time.Duration `env:"OUTBOX_RETRY_MAX_DELAY" envDefault:"5m"`
+	ErrorBackoff   time.Duration `env:"OUTBOX_ERROR_BACKOFF" envDefault:"5s"`
 }
 
 type Auth struct {
@@ -164,6 +201,30 @@ func (c Config) Validate() error {
 		check(isHTTPURL(c.Auth.Issuer), "AUTH_ISSUER must be an http(s) URL when the api role is enabled")
 		check(isHTTPURL(c.Auth.JWKSURL), "AUTH_JWKS_URL must be an http(s) URL when the api role is enabled")
 		check(c.Auth.Audience != "", "AUTH_AUDIENCE is required when the api role is enabled")
+	}
+
+	if c.App.HasRole(RoleConsumer) {
+		check(isHTTPURL(c.Consumer.QueueURL) && isHTTPURL(c.Consumer.DeadLetterURL), "SQS_INPUT_QUEUE_URL and SQS_DLQ_URL must be http(s) URLs when the consumer role is enabled")
+		check(c.Consumer.Name != "", "SQS_CONSUMER_NAME is required")
+		check(c.Consumer.Workers >= 1 && c.Consumer.MaxMessages >= 1 && c.Consumer.MaxMessages <= 10, "SQS_CONSUMER_WORKERS must be positive and SQS_MAX_MESSAGES within [1, 10]")
+		check(c.Consumer.WaitTime >= 0 && c.Consumer.WaitTime <= 20*time.Second, "SQS_WAIT_TIME must be within [0s, 20s]")
+		check(c.Consumer.ProcessingTimeout > 0 && c.Consumer.ProcessingTimeout < c.App.ShutdownTimeout, "SQS_PROCESSING_TIMEOUT must be positive and shorter than APP_SHUTDOWN_TIMEOUT")
+		check(c.Consumer.RetryBaseDelay >= time.Second && c.Consumer.RetryMaxDelay >= c.Consumer.RetryBaseDelay && c.Consumer.RetryMaxDelay <= 12*time.Hour,
+			"SQS_RETRY_BASE_DELAY must be at least 1s and SQS_RETRY_MAX_DELAY within [base, 12h]")
+		check(c.Consumer.ErrorBackoff > 0, "SQS_ERROR_BACKOFF must be positive")
+		check((c.AWS.ConsumerAccessKeyID == "") == (c.AWS.ConsumerSecretAccessKey == ""), "SQS_CONSUMER_ACCESS_KEY_ID and SQS_CONSUMER_SECRET_ACCESS_KEY must be set together")
+	}
+	if c.App.HasRole(RoleOutbox) {
+		check(strings.HasPrefix(c.Outbox.TopicARN, "arn:aws:sns:"), "SNS_EVENTS_TOPIC_ARN must be an SNS topic ARN when the outbox role is enabled")
+		check(c.Outbox.PollInterval > 0 && c.Outbox.BatchSize >= 1 && c.Outbox.ErrorBackoff >= c.Outbox.PollInterval, "OUTBOX_POLL_INTERVAL, OUTBOX_BATCH_SIZE and OUTBOX_ERROR_BACKOFF are inconsistent")
+		check(c.Outbox.PublishTimeout > 0 && c.Outbox.Lease > c.Outbox.PublishTimeout, "OUTBOX_LEASE must be longer than OUTBOX_PUBLISH_TIMEOUT")
+		check(c.Outbox.RetryBaseDelay > 0 && c.Outbox.RetryMaxDelay >= c.Outbox.RetryBaseDelay, "OUTBOX_RETRY_* values are inconsistent")
+		check((c.AWS.PublisherAccessKeyID == "") == (c.AWS.PublisherSecretAccessKey == ""), "SNS_PUBLISHER_ACCESS_KEY_ID and SNS_PUBLISHER_SECRET_ACCESS_KEY must be set together")
+	}
+	if c.App.HasRole(RoleConsumer) || c.App.HasRole(RoleOutbox) {
+		check(c.AWS.Region != "", "AWS_REGION is required")
+		check(c.AWS.EndpointURL == "" || isHTTPURL(c.AWS.EndpointURL), "AWS_ENDPOINT_URL must be an http(s) URL")
+		check(c.AWS.HealthTimeout > 0, "AWS_HEALTH_TIMEOUT must be positive")
 	}
 
 	if c.Tracing.Enabled {
