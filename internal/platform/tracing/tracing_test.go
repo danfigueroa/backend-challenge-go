@@ -2,6 +2,7 @@ package tracing_test
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	"go.opentelemetry.io/otel"
@@ -24,7 +25,7 @@ func TestDisabledTracingUsesNoopProviderAndW3CPropagation(t *testing.T) {
 	carrier := propagation.MapCarrier{}
 	otel.GetTextMapPropagator().Inject(context.Background(), carrier)
 	fields := otel.GetTextMapPropagator().Fields()
-	if len(fields) == 0 || fields[0] != "traceparent" {
+	if !slices.Contains(fields, "traceparent") {
 		t.Errorf("propagator fields = %v, want W3C trace context", fields)
 	}
 	if err := p.Shutdown(context.Background()); err != nil {
