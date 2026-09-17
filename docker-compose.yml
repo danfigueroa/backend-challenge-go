@@ -1,0 +1,171 @@
+name: wallet
+
+x-app: &app
+  build:
+    context: .
+    args:
+      BUILD_TAGS: ${BUILD_TAGS:-}
+  image: wallet-service:${BUILD_TAGS:-local}
+  restart: unless-stopped
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    keycloak:
+      condition: service_healthy
+    localstack:
+      condition: service_healthy
+    jaeger:
+      condition: service_started
+  environment: &app-env
+    APP_ROLES: api,consumer,outbox,pendingref
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    HTTP_ADDR: ":8080"
+    ADMIN_ADDR: ":9090"
+    DATABASE_URL: postgres://${APP_DB_USER:-wallet_service}:${APP_DB_PASSWORD:-local-service-password}@postgres:5432/${POSTGRES_DB:-wallet}?sslmode=disable
+    DATABASE_MAX_CONNS: "20"
+    AUTH_ISSUER: http://localhost:8081/realms/wagering
+    AUTH_JWKS_URL: http://keycloak:8080/realms/wagering/protocol/openid-connect/certs
+    AUTH_AUDIENCE: wallet-api
+    AWS_REGION: us-east-1
+    AWS_ENDPOINT_URL: http://localstack:4566
+    SQS_CONSUMER_ACCESS_KEY_ID: wager-transactions-consumer
+    SQS_CONSUMER_SECRET_ACCESS_KEY: local-consumer-secret
+    SNS_PUBLISHER_ACCESS_KEY_ID: wallet-events-publisher
+    SNS_PUBLISHER_SECRET_ACCESS_KEY: local-publisher-secret
+    SQS_INPUT_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions.fifo
+    SQS_DLQ_URL: http://localstack:4566/000000000000/wager-transactions-dlq.fifo
+    SNS_EVENTS_TOPIC_ARN: arn:aws:sns:us-east-1:000000000000:wallet-events.fifo
+    OTEL_TRACES_ENABLED: "true"
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+    OTEL_TRACES_SAMPLE_PERCENT: "100"
+
+services:
+  postgres:
+    image: postgres:18.6-alpine3.24
+    command: ["postgres", "-c", "max_connections=300"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-wallet_owner}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-owner-password}
+      POSTGRES_DB: ${POSTGRES_DB:-wallet}
+      APP_DB_USER: ${APP_DB_USER:-wallet_service}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-local-service-password}
+    ports:
+      - "${POSTGRES_HOST_PORT:-55432}:5432"
+    volumes:
+      - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -h 127.0.0.1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    build:
+      context: .
+    image: wallet-service:local
+    command: ["migrate", "up"]
+    environment:
+      DATABASE_MIGRATIONS_URL: postgres://${POSTGRES_USER:-wallet_owner}:${POSTGRES_PASSWORD:-local-owner-password}@postgres:5432/${POSTGRES_DB:-wallet}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.4
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HOSTNAME: http://localhost:8081
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./deploy/keycloak:/opt/keycloak/data/import:ro
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+
+  localstack:
+    image: localstack/localstack:4.14.0
+    environment:
+      SERVICES: sqs,sns,iam,sts
+      AWS_DEFAULT_REGION: us-east-1
+    ports:
+      - "4566:4566"
+    volumes:
+      - ./deploy/localstack/init/ready.d:/etc/localstack/init/ready.d:ro
+      - ./deploy/localstack/policies:/etc/localstack/policies:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:4566/_localstack/init/ready | grep -q '\"completed\": true'"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+
+  app-1:
+    <<: *app
+    environment:
+      <<: *app-env
+      APP_INSTANCE_ID: app-1
+    ports:
+      - "8091:8080"
+      - "9091:9090"
+
+  app-2:
+    <<: *app
+    environment:
+      <<: *app-env
+      APP_INSTANCE_ID: app-2
+    ports:
+      - "8092:8080"
+      - "9092:9090"
+
+  app-3:
+    <<: *app
+    environment:
+      <<: *app-env
+      APP_INSTANCE_ID: app-3
+    ports:
+      - "8093:8080"
+      - "9093:9090"
+
+  jaeger:
+    image: jaegertracing/jaeger:2.21.0
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--web.enable-lifecycle"]
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - app-1
+      - app-2
+      - app-3
+
+  grafana:
+    image: grafana/grafana:13.2.2
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres-data:
