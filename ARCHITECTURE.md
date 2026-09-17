@@ -1,22 +1,42 @@
 # Arquitetura
 
-Registro das decisões técnicas da solução. Cada seção é preenchida junto com a implementação correspondente; o progresso por requisito está em [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md).
+Registro das decisões técnicas da solução, das garantias e de como cada uma é verificada. A rastreabilidade requisito → código → teste está em [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md) e os resultados de carga em [`docs/LOAD_TEST.md`](docs/LOAD_TEST.md).
 
 ## Visão geral
 
 Arquitetura hexagonal (ports & adapters):
 
 ```
-cmd/wallet/          binário único (API, workers, subcomando migrate)
-internal/domain/     modelo puro: money, wallet, wagering, event
-internal/app/        casos de uso e ports (interfaces)
-internal/adapter/    postgres, http, auth, aws, sqsconsumer
-internal/worker/     outbox, pendingref, runner
-internal/platform/   config, logger, metrics, tracing, health, faultinject
-internal/fxapp/      módulos Fx e seleção de roles
+cmd/wallet/            binário único: serve, migrate, healthcheck
+internal/domain/       modelo puro: money, wallet, wagering, event
+internal/app/          casos de uso (walletapp, wageringapp), ports e autorização (Actor)
+internal/adapter/      postgres, httpapi, auth, awsclient, sqsconsumer
+internal/worker/       runner, outboxpub, pendingref
+internal/platform/     config, logging, metrics, tracing, health, httpserver, faultinject
+internal/fxapp/        módulos Fx e seleção de papéis
+internal/testsupport/  containers e harness dos testes de integração
 ```
 
-Regra de dependência: `domain` ← `app` ← `adapter`/`worker` ← `fxapp` ← `cmd`. O domínio não importa Fx, HTTP, SQS nem bibliotecas de persistência.
+```mermaid
+flowchart LR
+    P[Provedor] -- HTTP + JWT --> API
+    Q[(SQS FIFO<br/>wager-transactions)] --> C[Consumidor]
+    subgraph Instância
+        API[httpapi] --> UC[wageringapp / walletapp]
+        C --> UC
+        W[pendingref] --> UC
+        UC --> D[domain]
+        O[outboxpub]
+    end
+    UC -- "1 commit: transação, saldo, ledger, inbox, outbox" --> DB[(PostgreSQL)]
+    W -- claim SKIP LOCKED --> DB
+    O -- claim SKIP LOCKED --> DB
+    O --> SNS[(SNS FIFO<br/>wallet-events)]
+    C -- falha permanente --> DLQ[(DLQ)]
+    API -. JWKS .-> KC[Keycloak]
+```
+
+Regra de dependência: `domain` ← `app` ← `adapter`/`worker` ← `fxapp` ← `cmd`. O domínio não importa Fx, HTTP, SQS nem bibliotecas de persistência (verificável com `go list -deps ./internal/domain/...`). Todas as instâncias são iguais e sem estado local: qualquer uma atende qualquer requisição, mensagem, pendência ou evento.
 
 ## Decisões
 
@@ -41,6 +61,9 @@ Regra de dependência: `domain` ← `app` ← `adapter`/`worker` ← `fxapp` ←
 | Referências pendentes | TTL (padrão 30 min) + backoff exponencial com jitter; `WIN` com referência também aguarda | [Referências](#referências) |
 | Validação de carteira | Carteira inexistente/de outro jogador/outra moeda é erro corrigível, não persistido | [Serviço de domínio](#serviço-de-domínio-process) |
 | Identificadores externos | ASCII visível sem normalização; UUIDs canônicos minúsculos | [Requisição externa](#requisição-externa-request) |
+| Processamento | Síncrono dentro de uma transação; nenhum `PENDING` intermediário é commitado, só `PENDING_REFERENCE` | [Máquina de estados](#máquina-de-estados) |
+| Publicação de eventos | Paralela entre carteiras, sequencial dentro de cada carteira | [Publicação com transactional outbox](#publicação-com-transactional-outbox) |
+| Verificação | Integração com containers reais; e2e com processos independentes, crash injetado e quedas de rede; carga com k6 | [Testes multi-processo e injeção de falhas](#testes-multi-processo-e-injeção-de-falhas) |
 
 ## Dinheiro
 
@@ -208,6 +231,19 @@ stateDiagram-v2
 - `FAILED` só aceita códigos de categoria `INFRASTRUCTURE`.
 - `PENDING_REFERENCE` exige `nextAttemptAt` e `expiresAt`; `expiresAt` é fixado na primeira espera e nunca muda; cada nova espera incrementa `attempts`.
 
+**Aceite síncrono**: `PENDING` existe apenas em memória durante o processamento. A transação nasce, é decidida e é gravada já no estado final (`PROCESSED`/`REJECTED`) ou em `PENDING_REFERENCE`, tudo no mesmo commit que movimenta o saldo. Não há commit intermediário de aceite, portanto não existe `PENDING` confirmado que dependa de retomada. O schema e o worker aceitam `PENDING` mesmo assim (claim por `status IN ('PENDING','PENDING_REFERENCE')`), de forma que um aceite assíncrono futuro já teria retomada durável.
+
+**Falhas transitórias × permanentes**:
+
+| Tipo | Exemplos | Tratamento | Estado persistido |
+|---|---|---|---|
+| Transitória | conexão perdida, `lock_timeout`, deadlock, serialização, timeout de contexto, corrida de unicidade | nova tentativa da unidade de trabalho inteira (`app.Retry`); esgotada, HTTP devolve 503 com `Retry-After`, SQS devolve a mensagem com backoff e o worker mantém a pendência para depois | nenhum (rollback) |
+| Regra de negócio | saldo insuficiente, referência inválida ou expirada | decisão do domínio | `REJECTED` com `failureCode` |
+| Entrada corrigível | validação, carteira inexistente ou divergente | 400 / DLQ com motivo | nenhum |
+| Permanente de infraestrutura | erro inesperado ao retomar uma pendência (por exemplo, dado reidratado inconsistente) | registrado para auditoria | `FAILED` com `INTERNAL_PROCESSING_FAILED` |
+
+A classificação é feita na borda da persistência (ver [Classificação de erros](#classificação-de-erros)) e consultada por `app.IsRetryable`.
+
 ### Serviço de domínio `Process`
 
 `wagering.Process` concentra a regra de negócio e é usado tanto pelo processamento síncrono (HTTP/SQS) quanto pelo worker de pendências. Recebe a transação, a carteira **já bloqueada**, a referência resolvida (se houver), o ID do lançamento, o instante atual e a política de espera, e devolve uma `Decision` (`PROCESSED`, `REJECTED` ou `AWAITING_REFERENCE`) com o lançamento criado, quando existir. A camada de aplicação apenas carrega, persiste e publica.
@@ -258,7 +294,7 @@ O intervalo da tentativa `n` é `min(BaseDelay × 2^(n−1), MaxDelay) + jitter`
 
 ## Reversões
 
-Regra adotada: **cada transação pode ser revertida com sucesso no máximo uma vez**, por `REFUND` ou por `ROLLBACK`. No banco, isso será garantido por um índice único parcial em `reference_transaction_id` para `REFUND`/`ROLLBACK` em `PROCESSED`; no domínio, pela flag `AlreadyReversed` informada pelo repositório (com a linha da referência bloqueada).
+Regra adotada: **cada transação pode ser revertida com sucesso no máximo uma vez**, por `REFUND` ou por `ROLLBACK`. No banco, isso é garantido por um índice único parcial em `reference_transaction_id` para `REFUND`/`ROLLBACK` em `PROCESSED`; no domínio, pela flag `AlreadyReversed` informada pelo repositório (com a linha da referência bloqueada).
 
 | Sequência sobre a mesma `BET` | Resultado |
 |---|---|
@@ -439,7 +475,7 @@ Pacotes `internal/app/walletapp` e `internal/app/wageringapp`. Dependem apenas d
 
 ### Autorização na camada de aplicação
 
-Além da validação do token no HTTP (Fase 5), todo caso de uso recebe um `app.Actor`, e a regra é verificada **também aqui**. Assim, nenhum adapter consegue esquecer a checagem.
+Além da validação do token no HTTP, todo caso de uso recebe um `app.Actor`, e a regra é verificada **também aqui**. Assim, nenhum adapter consegue esquecer a checagem.
 
 | Actor | Origem | Pode |
 |---|---|---|
@@ -457,7 +493,7 @@ Além da validação do token no HTTP (Fase 5), todo caso de uso recebe um `app.
 
 ### Observabilidade dos casos de uso
 
-Os serviços recebem um `app.Observer` (implementado com Prometheus na Fase 4) e emitem, **após o commit**: transação concluída (canal, tipo, status, código, replay e latência), conflito de idempotência, retry e resultado de reconciliação.
+Os serviços recebem um `app.Observer` (implementado com Prometheus e logs) e emitem, **após o commit**: transação concluída (canal, tipo, status, código, replay e latência), conflito de idempotência, retry e resultado de reconciliação.
 
 ## Idempotência
 
@@ -525,21 +561,21 @@ Testes de integração que comprovam o comportamento com PostgreSQL real:
 | HTTP e SQS simultâneos para a mesma operação | `TestConcurrentHTTPAndSQSForTheSameOperation` | 1 transação, 10 mensagens na inbox |
 | Três instâncias resolvendo pendências | `TestConcurrentWorkersResolveEachPendingOnce` | cada pendência processada uma única vez |
 
-Todos terminam verificando que o saldo de cada carteira é igual à soma do ledger. A execução com múltiplos **processos** independentes é coberta na Fase 7.
+Todos terminam verificando que o saldo de cada carteira é igual à soma do ledger. Os mesmos cenários com **processos** independentes estão em [Testes multi-processo e injeção de falhas](#testes-multi-processo-e-injeção-de-falhas).
 
 ## Worker de referências pendentes
 
-`ResolveDuePending(limit)` executa um ciclo do worker (o loop com `fx.Lifecycle` vem na Fase 6):
+`internal/worker/pendingref`, papel `pendingref`. A cada `PENDING_POLL_INTERVAL` (ou imediatamente, enquanto houver lote cheio), o worker chama `ResolveDuePending(limit)` com um contexto próprio limitado por `PENDING_ITERATION_TIMEOUT`:
 
 1. Transação curta: `ClaimDuePending` seleciona até `limit` pendências vencidas com `FOR UPDATE SKIP LOCKED` e empurra `next_attempt_at` para `now + lease`. Outras instâncias não pegam o mesmo item enquanto o lease vale.
 2. Para cada item, em transação própria e na ordem de locks **carteira → transação → referência**: relê o estado (se já estiver terminal, nada acontece), resolve a referência e chama `wagering.Process`.
 3. Resultado:
-   - `PROCESSED`/`REJECTED`: grava a transação, a carteira, o lançamento, os eventos e acorda dependentes.
+   - `PROCESSED`/`REJECTED`: grava a transação, a carteira, o lançamento, os eventos e acorda as pendências que a referenciam.
    - ainda pendente: grava o novo agendamento sem novo evento, porque `WagerTransactionPendingReference` só é emitido no primeiro registro.
 4. Erro transitório: o item fica para depois (o lease expira e qualquer instância o retoma).
 5. Erro permanente inesperado: a transação vai para `FAILED` com `INTERNAL_PROCESSING_FAILED`, para auditoria.
 
-Quando uma operação é processada, `WakeWaitingOn` antecipa `next_attempt_at` das pendências que a referenciam, então uma reversão que chegou antes da aposta é resolvida no próximo ciclo, sem esperar o backoff.
+Quando uma operação chega a um estado terminal (`PROCESSED`, `REJECTED` ou `FAILED`), `WakeWaitingOn` antecipa `next_attempt_at` das pendências que a referenciam, na mesma transação. Uma reversão que chegou antes da aposta é aplicada no próximo ciclo se a aposta for processada, ou rejeitada com `REFERENCE_NOT_PROCESSED` se a aposta for rejeitada, sem esperar o backoff (`TestReversalArrivingBeforeReferenceIsResolvedLater`, `TestReversalWaitingOnRejectedReferenceIsWokenAndRejected`).
 
 Como o estado vive só no banco, pendências sobrevivem a reinícios e são retomadas por qualquer instância (`TestPendingSurvivesRestartAndIsResumedByAnotherInstance`).
 
@@ -551,7 +587,7 @@ Como o estado vive só no banco, pendências sobrevivem a reinícios e são reto
 - `difference` = `storedBalance − calculatedBalance`;
 - `consistent` exige diferença zero, cadeia do ledger íntegra (`balance_before[n] = balance_after[n−1]`), versão da carteira igual à do último lançamento e saldo igual ao `balance_after` do último lançamento (ou versão 1 com saldo zero, sem lançamentos).
 
-A reconciliação nunca altera dados. O resultado é enviado ao `Observer` (métrica e log de divergência na Fase 4). O teste `TestReconciliationDetectsDivergenceWithoutChangingBalance` cria uma divergência real desligando os triggers numa sessão de superusuário (`session_replication_role = replica`) e confirma que ela é reportada.
+A reconciliação nunca altera dados. O resultado é enviado ao `Observer`: divergências incrementam `wallet_reconciliation_divergences_total` e geram log `ERROR` com a diferença, além de aparecerem na resposta. O teste `TestReconciliationDetectsDivergenceWithoutChangingBalance` cria uma divergência real desligando os triggers numa sessão de superusuário (`session_replication_role = replica`) e confirma que ela é reportada.
 
 ## Mensageria
 
@@ -620,6 +656,10 @@ Mensagens enviadas explicitamente à DLQ levam os atributos `dlqReason`, `dlqErr
 **Garantia de remoção após commit**: o delete só acontece depois que `wageringapp.Process` retorna, e esse retorno implica que a transação SQL (inbox + domínio + ledger + outbox) foi confirmada. Uma queda entre o commit e o delete gera reentrega, que é respondida da inbox sem novo efeito financeiro (`TestCrashAfterCommitBeforeDeleteIsRedeliveredSafely`).
 
 **Concorrência**: `SQS_CONSUMER_WORKERS` loops de long polling por instância, cada um processando o lote recebido em sequência. O FIFO não entrega em paralelo mensagens do mesmo grupo (carteira), e o lock de linha da carteira protege contra concorrência com HTTP e outras instâncias.
+
+**Ordem dentro do lote após falha transitória**: se uma mensagem de um grupo falha de forma transitória, as mensagens seguintes do mesmo grupo que vieram no mesmo `ReceiveMessage` continuam sendo processadas. Segurá-las exigiria devolvê-las à fila, o que consome recebimentos e poderia mandar para a DLQ, via redrive, mensagens que nunca falharam. A escolha é segura porque o domínio não depende da ordem de chegada: uma reversão ou `WIN` que chega antes da `BET` fica em `PENDING_REFERENCE` e é resolvida quando a referência for processada, e cada operação é idempotente.
+
+**Indisponibilidade do banco**: o consumidor devolve a mensagem com backoff de visibilidade. Com os padrões (`2s`, `4s`, `8s`, `16s`, `32s` até o redrive após 5 recebimentos), uma mensagem tolera cerca de um minuto de indisponibilidade antes de ir para a DLQ, onde fica preservada para reprocessamento (`TestDatabaseOutageIsReportedAndRecoveredWithoutDuplicates`).
 
 **Limites e timeouts**: `SQS_PROCESSING_TIMEOUT` (10 s) é menor que o `VisibilityTimeout` da fila (30 s), então uma mensagem não fica visível enquanto é processada. O processamento usa um contexto desacoplado do cancelamento do worker, com esse timeout.
 
@@ -868,9 +908,9 @@ Prometheus em `GET /metrics` no servidor administrativo (`ADMIN_ADDR`, separado 
 | `wallet_reconciliations_total` / `wallet_reconciliation_divergences_total` | counter | `result` | divergências de reconciliação |
 | `wallet_pending_reference_resolutions_total` | counter | `outcome` | resolução de pendências |
 | `wallet_outbox_pending_events` / `wallet_outbox_lag_seconds` | gauge (lidos no scrape) | — | atraso da outbox |
-| `wallet_outbox_publish_attempts_total` / `wallet_outbox_publish_duration_seconds` | counter / histogram | `event_type`, `result` | publicação (Fase 6) |
-| `wallet_sqs_messages_total` / `wallet_sqs_dead_lettered_total` | counter | `queue`, `result`/`reason` | consumo e DLQ (Fase 6) |
-| `wallet_http_requests_total` / `wallet_http_request_duration_seconds` | counter / histogram | `route`, `method`, `code` | API (Fase 5) |
+| `wallet_outbox_publish_attempts_total` / `wallet_outbox_publish_duration_seconds` | counter / histogram | `event_type`, `result` (`published`, `failed`, `postponed`, `unconfirmed`, `lease_lost`) | publicação |
+| `wallet_sqs_messages_total` / `wallet_sqs_dead_lettered_total` | counter | `queue`, `result`/`reason` | duplicatas, retries e DLQ |
+| `wallet_http_requests_total` / `wallet_http_request_duration_seconds` | counter / histogram | `route`, `method`, `code` | API |
 | `wallet_worker_errors_total` | counter | `worker` | falhas de iteração |
 | `go_*`, `process_*` | — | — | runtime |
 
@@ -909,7 +949,7 @@ Os checks rodam em paralelo, com timeout individual (`DATABASE_HEALTH_TIMEOUT`) 
 - **Ordem de subida**: as instâncias dependem de `migrate` concluído com sucesso (`service_completed_successfully`) e de Keycloak/LocalStack saudáveis. Migrations nunca rodam dentro do processo da aplicação, evitando corrida entre instâncias.
 - **Credenciais separadas**: `migrate` usa o dono do schema (`wallet_owner`); as instâncias usam `wallet_service`, que só tem os privilégios de `wallet_app`.
 - **Emissor do token**: `AUTH_ISSUER` é `http://localhost:8081/realms/wagering` (o endereço que os clientes usam para obter tokens), enquanto `AUTH_JWKS_URL` aponta para `keycloak:8080` dentro da rede. Separar emissor e JWKS permite validar `iss` exatamente sem exigir que o container resolva `localhost` para o Keycloak.
-- **Healthchecks**: a imagem distroless executa `/wallet healthcheck`, que consulta `/health/ready` do servidor administrativo; o compose só considera a stack pronta quando PostgreSQL, SQS e SNS respondem em cada instância.
+- **Healthchecks**: a imagem distroless executa `/wallet healthcheck`, que consulta `/health/live` do servidor administrativo. O servidor administrativo só sobe depois do ping ao PostgreSQL, e os workers só iniciam depois de verificar fila, DLQ e tópico; a disponibilidade para tráfego é informada por `/health/ready`. O healthcheck do container usa liveness para que uma queda temporária de dependência não marque o processo como defeituoso.
 - **Escala independente**: todas as instâncias do compose rodam todos os papéis, mas `APP_ROLES` permite separar API, consumidores, publisher e worker de pendências em deployments distintos.
 
 ## Testes multi-processo e injeção de falhas
@@ -935,7 +975,20 @@ Cada teste cria um banco novo (migrado pelo subcomando `wallet migrate up`), fil
 
 Além dos pontos de falha, a suíte cobre concorrência entre instâncias (50 apostas idênticas, 80+80 sobre 100, 20 carteiras com apostas e ganhos), a mesma operação por HTTP e SQS ao mesmo tempo, reversão pendente que sobrevive a `kill -9`, expiração por TTL, `kill -9` durante carga com retries do cliente e reinício gracioso preservando idempotência. Requisições interrompidas pelo crash recebem erro de rede; o cliente repete com a mesma chave e recebe o resultado original ou o processamento único, nunca um segundo débito.
 
+### Quedas de dependências
+
+O harness inclui um proxy TCP (`test/e2e/proxy_test.go`) entre os processos e o PostgreSQL ou o LocalStack. `cut()` encerra as conexões abertas e recusa novas; `restore()` volta a encaminhar. Diferente de parar o container, isso afeta só os processos do teste e reproduz uma partição de rede real, com conexões do pool quebrando no meio.
+
+| Cenário | Durante a queda | Após a recuperação |
+|---|---|---|
+| PostgreSQL (`TestDatabaseOutageIsReportedAndRecoveredWithoutDuplicates`) | readiness `503` nas duas instâncias; `POST /wagering/transactions` responde `503` com `Retry-After` sem persistir nada; mensagem SQS recebe retry com backoff (métrica `RETRY`) | readiness `200`; o cliente repete a mesma chave e a aposta é processada uma vez; a mensagem é consumida sem ir para a DLQ; outbox esvaziada; 2 débitos, saldo exato |
+| LocalStack (`TestBrokerOutageDelaysMessagingWithoutLosingEvents`) | readiness `503`; a API continua processando apostas (só depende do banco); eventos se acumulam na outbox; a mensagem enviada não é consumida | consumo retomado; outbox esvaziada; cada evento chega **uma única vez** à fila assinante; saldo exato |
+
 Toda execução termina com a verificação de consistência financeira feita direto no banco: saldo igual à soma assinada do ledger, saldo não negativo, versão da carteira igual à da última entrada e nenhuma transação com mais de uma entrada.
+
+## Desempenho
+
+Resumo do teste de carga com toda a stack em um MacBook de 8 núcleos: ~790 req/s com p95 de 57 ms em `BET` e 0 divergências no perfil base; no perfil de estresse a vazão estabiliza em ~750–800 tx/s com degradação graciosa (latência maior, nenhum erro nem divergência). O teste encontrou e motivou duas correções (busca indexada no trigger adiado e publicação paralela da outbox). Detalhes em [docs/LOAD_TEST.md](docs/LOAD_TEST.md).
 
 ## Limitações e interpretações
 
@@ -950,4 +1003,15 @@ Toda execução termina com a verificação de consistência financeira feita di
 - **Aleatoriedade**: `math/rand/v2` é usado apenas para jitter de backoff; por isso a regra G404 do gosec está desabilitada. Identificadores usam UUIDv7 (`crypto/rand`).
 - **IAM no LocalStack**: identidades, políticas e políticas de recurso são provisionadas, mas não aplicadas pela edição community (ver [Credenciais e políticas do broker](#credenciais-e-políticas-do-broker)).
 - **Ordem de eventos após retry**: dentro de um lote, uma falha adia os eventos seguintes da mesma carteira. Entre lotes de publishers diferentes, eventos de uma carteira podem ser reservados por instâncias distintas e, após falhas e leases expirados, chegar fora de ordem; consumidores devem usar `walletVersion`.
-- **Retenção da outbox**: eventos publicados podem ser apagados (o trigger só retém os não publicados), mas o job de retenção não faz parte do escopo.
+- **Ordem de mensagens SQS no mesmo lote**: ver [Consumidor SQS](#consumidor-sqs); a correção financeira não depende da ordem de chegada.
+- **Tolerância do consumidor a quedas longas**: com os padrões, cerca de um minuto de indisponibilidade do banco antes do redrive para a DLQ; ajustável por `SQS_RETRY_*` e `maxReceiveCount`.
+- **Vazão da outbox no ambiente local**: limitada pelo LocalStack (~750 eventos/s); em AWS real o gargalo passa a ser o banco e escala com instâncias no papel `outbox`.
+
+### Fora do escopo / trabalho não concluído
+
+- **Retenção**: eventos publicados da outbox podem ser apagados pela aplicação (o trigger só retém os não publicados), mas o job de retenção não foi implementado; a inbox cresce indefinidamente e exigiria particionamento ou expurgo por idade.
+- **Reprocessamento da DLQ**: mensagens chegam à DLQ com motivo e corpo original, mas não há ferramenta para devolvê-las à fila de entrada (em AWS usa-se `StartMessageMoveTask`).
+- **Ledger de partidas dobradas** (opcional no enunciado): o ledger é de partida simples por carteira.
+- **Rate limiting** e cotas por provedor na API.
+- **Aceite assíncrono**: não utilizado (ver [Máquina de estados](#máquina-de-estados)).
+- **Pipeline de CI**: o workflow está versionado, mas as execuções documentadas foram feitas localmente.
