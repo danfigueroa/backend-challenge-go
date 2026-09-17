@@ -6,6 +6,4 @@ bin
 coverage.*
 docs
 test/load/results
-CLAUDE.md
-.claude
 *.md
