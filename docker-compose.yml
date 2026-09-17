@@ -37,7 +37,7 @@ x-app: &app
     SNS_EVENTS_TOPIC_ARN: arn:aws:sns:us-east-1:000000000000:wallet-events.fifo
     OTEL_TRACES_ENABLED: "true"
     OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
-    OTEL_TRACES_SAMPLE_PERCENT: "100"
+    OTEL_TRACES_SAMPLE_PERCENT: ${OTEL_TRACES_SAMPLE_PERCENT:-100}
 
 services:
   postgres:
