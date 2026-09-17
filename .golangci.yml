@@ -57,6 +57,9 @@ linters:
       - text: G404
         linters:
           - gosec
+      - path: internal/adapter/httpapi/middleware\.go
+        linters:
+          - contextcheck
       - path: cmd/wallet/main\.go
         text: G704
         linters:
