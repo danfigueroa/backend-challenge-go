@@ -30,6 +30,12 @@ func Options(cfg config.Config, extra ...fx.Option) fx.Option {
 	if cfg.App.HasRole(config.RoleAPI) {
 		options = append(options, APIModule)
 	}
+	if cfg.App.HasRole(config.RoleConsumer) {
+		options = append(options, ConsumerModule)
+	}
+	if cfg.App.HasRole(config.RoleOutbox) {
+		options = append(options, OutboxModule)
+	}
 	if cfg.App.HasRole(config.RolePendingRef) {
 		options = append(options, PendingReferenceModule)
 	}
