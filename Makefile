@@ -101,5 +101,9 @@ migrate-version: ## Show current migration version
 ## ---------- Load ----------
 
 .PHONY: load
-load: ## Run k6 load test (dockerized k6)
+load: ## Baseline k6 load test against the running stack (see docs/LOAD_TEST.md)
 	$(COMPOSE) --profile load run --rm k6
+
+.PHONY: load-stress
+load-stress: ## k6 stress profile beyond the local capacity
+	LOAD_RATE=200 LOAD_HOT_VUS=40 $(COMPOSE) --profile load run --rm k6
