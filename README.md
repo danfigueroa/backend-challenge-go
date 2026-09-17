@@ -96,6 +96,16 @@ Valores de exemplo em [`.env.example`](.env.example). A configuração é valida
 | `AUTH_ISSUER` | — (obrigatório com papel `api`) | Valor esperado do `iss` dos tokens |
 | `AUTH_JWKS_URL` | — (obrigatório com papel `api`) | Endpoint de chaves do IdP (pode usar a rede interna) |
 | `AUTH_AUDIENCE` | `wallet-api` | Audience exigida |
+| `AWS_REGION` / `AWS_ENDPOINT_URL` | `us-east-1` / — | Região e endpoint (LocalStack) |
+| `SQS_CONSUMER_ACCESS_KEY_ID` / `SQS_CONSUMER_SECRET_ACCESS_KEY` | — | Credenciais do consumidor (padrão da AWS se vazio) |
+| `SNS_PUBLISHER_ACCESS_KEY_ID` / `SNS_PUBLISHER_SECRET_ACCESS_KEY` | — | Credenciais do publisher |
+| `SQS_INPUT_QUEUE_URL` / `SQS_DLQ_URL` | — (obrigatório com papel `consumer`) | Filas de entrada e dead-letter |
+| `SQS_CONSUMER_WORKERS` / `SQS_MAX_MESSAGES` / `SQS_WAIT_TIME` | `4` / `10` / `20s` | Paralelismo e long polling |
+| `SQS_PROCESSING_TIMEOUT` | `10s` | Prazo por mensagem (menor que a visibilidade da fila) |
+| `SQS_RETRY_BASE_DELAY` / `SQS_RETRY_MAX_DELAY` | `2s` / `60s` | Backoff de visibilidade para falhas transitórias |
+| `SNS_EVENTS_TOPIC_ARN` | — (obrigatório com papel `outbox`) | Destino dos eventos |
+| `OUTBOX_POLL_INTERVAL` / `OUTBOX_BATCH_SIZE` / `OUTBOX_LEASE` | `500ms` / `50` / `30s` | Publisher da outbox |
+| `OUTBOX_RETRY_BASE_DELAY` / `OUTBOX_RETRY_MAX_DELAY` | `1s` / `5m` | Backoff de publicação |
 
 ## Autenticação
 
@@ -141,4 +151,34 @@ Status e corpos de cada situação (200, 202, 400, 401, 403, 404, 409, 413, 415,
 
 Os testes de integração da API (`internal/adapter/httpapi`) sobem **Keycloak e PostgreSQL reais** via testcontainers.
 
-As seções de Docker Compose, filas e testes multi-instância/falhas serão adicionadas à medida que cada componente for entregue.
+## Filas e eventos
+
+O LocalStack executa `deploy/localstack/init/ready.d/01-provision-messaging.sh` automaticamente e cria:
+- as filas `wager-transactions.fifo` e `wager-transactions-dlq.fifo` (redrive após 5 recebimentos);
+- o tópico `wallet-events.fifo`;
+- a fila assinante `wallet-events-audit.fifo`;
+- as identidades IAM de produtor, consumidor e publisher.
+
+Detalhes em [ARCHITECTURE.md › Mensageria](ARCHITECTURE.md#mensageria).
+
+Enviar uma operação pela fila (troque `WALLET_ID`/`PLAYER_ID`):
+
+```sh
+aws --endpoint-url http://localhost:4566 sqs send-message \
+  --queue-url http://localhost:4566/000000000000/wager-transactions.fifo \
+  --message-group-id "$WALLET_ID" --message-deduplication-id msg-123 \
+  --message-body '{"messageId":"msg-123","type":"WagerTransactionRequested","occurredAt":"2026-09-08T12:00:00.000Z","data":{"providerId":"provider-a","externalTransactionId":"transaction-123","idempotencyKey":"provider-a:transaction-123","playerId":"'$PLAYER_ID'","walletId":"'$WALLET_ID'","roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}}'
+```
+
+Ler os eventos publicados e a DLQ:
+
+```sh
+aws --endpoint-url http://localhost:4566 sqs receive-message --max-number-of-messages 10 \
+  --queue-url http://localhost:4566/000000000000/wallet-events-audit.fifo --message-attribute-names All
+aws --endpoint-url http://localhost:4566 sqs receive-message --max-number-of-messages 10 \
+  --queue-url http://localhost:4566/000000000000/wager-transactions-dlq.fifo --message-attribute-names All
+```
+
+Os testes do consumidor (`internal/adapter/sqsconsumer`), do publisher (`internal/worker/outboxpub`) e da composição com todos os papéis (`internal/fxapp`) sobem **LocalStack e PostgreSQL reais**.
+
+As seções de Docker Compose e testes multi-instância/falhas serão adicionadas à medida que cada componente for entregue.
