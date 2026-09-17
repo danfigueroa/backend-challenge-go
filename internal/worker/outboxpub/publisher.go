@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -41,6 +42,7 @@ type Settings struct {
 	PollInterval   time.Duration
 	ErrorBackoff   time.Duration
 	BatchSize      int
+	Concurrency    int
 	Lease          time.Duration
 	PublishTimeout time.Duration
 	RetryBaseDelay time.Duration
@@ -67,8 +69,8 @@ func New(client SNSAPI, store Store, clock app.Clock, s Settings, hooks Hooks, m
 		return nil, errors.New("outboxpub: all dependencies are required")
 	case s.Owner == "" || s.TopicARN == "":
 		return nil, errors.New("outboxpub: owner and topic ARN are required")
-	case s.BatchSize < 1 || s.PollInterval <= 0 || s.ErrorBackoff < s.PollInterval:
-		return nil, errors.New("outboxpub: invalid batch size, poll interval or error backoff")
+	case s.BatchSize < 1 || s.Concurrency < 1 || s.PollInterval <= 0 || s.ErrorBackoff < s.PollInterval:
+		return nil, errors.New("outboxpub: invalid batch size, concurrency, poll interval or error backoff")
 	case s.PublishTimeout <= 0 || s.Lease <= s.PublishTimeout:
 		return nil, errors.New("outboxpub: lease must be longer than the publish timeout")
 	case s.RetryBaseDelay <= 0 || s.RetryMaxDelay < s.RetryBaseDelay:
@@ -101,17 +103,58 @@ func (p *Publisher) PublishBatch(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("claim outbox events: %w", err)
 	}
 
-	for i, record := range records {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			p.release(ctx, records[i:])
-			return false, fmt.Errorf("publisher stopping: %w", ctxErr)
-		}
-		p.publish(ctx, record)
+	partitions := partitionByKey(records)
+	queue := make(chan []app.OutboxRecord)
+	var wg sync.WaitGroup
+	for range min(p.settings.Concurrency, len(partitions)) {
+		wg.Go(func() {
+			for events := range queue {
+				p.publishPartition(ctx, events)
+			}
+		})
+	}
+	for _, events := range partitions {
+		queue <- events
+	}
+	close(queue)
+	wg.Wait()
+
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, fmt.Errorf("publisher stopping: %w", ctxErr)
 	}
 	return len(records) == p.settings.BatchSize, nil
 }
 
-func (p *Publisher) publish(parent context.Context, record app.OutboxRecord) {
+func partitionByKey(records []app.OutboxRecord) [][]app.OutboxRecord {
+	index := make(map[string]int, len(records))
+	var partitions [][]app.OutboxRecord
+	for _, record := range records {
+		i, ok := index[record.PartitionKey]
+		if !ok {
+			i = len(partitions)
+			index[record.PartitionKey] = i
+			partitions = append(partitions, nil)
+		}
+		partitions[i] = append(partitions[i], record)
+	}
+	return partitions
+}
+
+func (p *Publisher) publishPartition(ctx context.Context, events []app.OutboxRecord) {
+	for i, record := range events {
+		if ctx.Err() != nil {
+			p.release(ctx, events[i:])
+			return
+		}
+		retryAt, err := p.publish(ctx, record)
+		if err != nil {
+			p.postpone(ctx, record, events[i+1:], retryAt, err)
+			return
+		}
+	}
+}
+
+func (p *Publisher) publish(parent context.Context, record app.OutboxRecord) (time.Time, error) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), p.settings.PublishTimeout)
 	defer cancel()
 	log := p.logger.With(slog.String("eventId", record.EventID.String()), slog.String("eventType", string(record.EventType)),
@@ -131,14 +174,13 @@ func (p *Publisher) publish(parent context.Context, record app.OutboxRecord) {
 	})
 	p.metrics.OutboxPublishDuration.Observe(time.Since(started).Seconds())
 	if err != nil {
-		p.scheduleRetry(ctx, log, record, err)
-		return
+		return p.scheduleRetry(ctx, log, record, err), err
 	}
 
 	if p.hooks.AfterPublish != nil {
 		if err := p.hooks.AfterPublish(ctx, record); err != nil {
 			log.WarnContext(ctx, "event published but not confirmed; the lease will expire and it will be republished with the same eventId", slog.Any("error", err))
-			return
+			return time.Time{}, nil
 		}
 	}
 
@@ -156,19 +198,39 @@ func (p *Publisher) publish(parent context.Context, record app.OutboxRecord) {
 		p.metrics.OutboxPublishedTotal.WithLabelValues(string(record.EventType), "published").Inc()
 		log.DebugContext(ctx, "event published")
 	}
+	return time.Time{}, nil
 }
 
-func (p *Publisher) scheduleRetry(ctx context.Context, log *slog.Logger, record app.OutboxRecord, cause error) {
+func (p *Publisher) scheduleRetry(ctx context.Context, log *slog.Logger, record app.OutboxRecord, cause error) time.Time {
 	delay := p.RetryDelay(record.Attempts)
+	retryAt := p.clock.Now().Add(delay)
 	p.metrics.OutboxPublishedTotal.WithLabelValues(string(record.EventType), "failed").Inc()
 	p.metrics.RetriesTotal.WithLabelValues("outbox_publish", "transient").Inc()
 	log.WarnContext(ctx, "event publication failed; scheduling retry", slog.Duration("delay", delay), slog.Any("error", cause))
 
 	retryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), storeOperationTimeout)
 	defer cancel()
-	if _, err := p.store.ScheduleRetry(retryCtx, record.EventID, p.settings.Owner, p.clock.Now().Add(delay), cause.Error()); err != nil {
+	if _, err := p.store.ScheduleRetry(retryCtx, record.EventID, p.settings.Owner, retryAt, cause.Error()); err != nil {
 		log.WarnContext(ctx, "could not schedule retry; the lease will expire and the event will be retried", slog.Any("error", err))
 	}
+	return retryAt
+}
+
+func (p *Publisher) postpone(parent context.Context, failed app.OutboxRecord, followers []app.OutboxRecord, retryAt time.Time, cause error) {
+	if len(followers) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), storeOperationTimeout)
+	defer cancel()
+	reason := fmt.Sprintf("waiting for preceding event %s: %v", failed.EventID, cause)
+	for _, record := range followers {
+		p.metrics.OutboxPublishedTotal.WithLabelValues(string(record.EventType), "postponed").Inc()
+		if _, err := p.store.ScheduleRetry(ctx, record.EventID, p.settings.Owner, retryAt, reason); err != nil {
+			p.logger.WarnContext(ctx, "could not postpone event; its lease will expire", slog.String("eventId", record.EventID.String()), slog.Any("error", err))
+		}
+	}
+	p.logger.InfoContext(ctx, "postponed events behind a failed publication to keep partition order",
+		slog.String("partitionKey", failed.PartitionKey), slog.Int("count", len(followers)))
 }
 
 func (p *Publisher) RetryDelay(attempts int) time.Duration {

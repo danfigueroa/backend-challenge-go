@@ -113,7 +113,8 @@ type Consumer struct {
 type Outbox struct {
 	TopicARN       string        `env:"SNS_EVENTS_TOPIC_ARN"`
 	PollInterval   time.Duration `env:"OUTBOX_POLL_INTERVAL" envDefault:"500ms"`
-	BatchSize      int           `env:"OUTBOX_BATCH_SIZE" envDefault:"50"`
+	BatchSize      int           `env:"OUTBOX_BATCH_SIZE" envDefault:"100"`
+	Concurrency    int           `env:"OUTBOX_PUBLISH_CONCURRENCY" envDefault:"8"`
 	Lease          time.Duration `env:"OUTBOX_LEASE" envDefault:"30s"`
 	PublishTimeout time.Duration `env:"OUTBOX_PUBLISH_TIMEOUT" envDefault:"5s"`
 	RetryBaseDelay time.Duration `env:"OUTBOX_RETRY_BASE_DELAY" envDefault:"1s"`
@@ -217,6 +218,7 @@ func (c Config) Validate() error {
 	if c.App.HasRole(RoleOutbox) {
 		check(strings.HasPrefix(c.Outbox.TopicARN, "arn:aws:sns:"), "SNS_EVENTS_TOPIC_ARN must be an SNS topic ARN when the outbox role is enabled")
 		check(c.Outbox.PollInterval > 0 && c.Outbox.BatchSize >= 1 && c.Outbox.ErrorBackoff >= c.Outbox.PollInterval, "OUTBOX_POLL_INTERVAL, OUTBOX_BATCH_SIZE and OUTBOX_ERROR_BACKOFF are inconsistent")
+		check(c.Outbox.Concurrency >= 1 && c.Outbox.Concurrency <= c.Outbox.BatchSize, "OUTBOX_PUBLISH_CONCURRENCY must be between 1 and OUTBOX_BATCH_SIZE")
 		check(c.Outbox.PublishTimeout > 0 && c.Outbox.Lease > c.Outbox.PublishTimeout, "OUTBOX_LEASE must be longer than OUTBOX_PUBLISH_TIMEOUT")
 		check(c.Outbox.RetryBaseDelay > 0 && c.Outbox.RetryMaxDelay >= c.Outbox.RetryBaseDelay, "OUTBOX_RETRY_* values are inconsistent")
 		check((c.AWS.PublisherAccessKeyID == "") == (c.AWS.PublisherSecretAccessKey == ""), "SNS_PUBLISHER_ACCESS_KEY_ID and SNS_PUBLISHER_SECRET_ACCESS_KEY must be set together")

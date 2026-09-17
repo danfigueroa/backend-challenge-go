@@ -127,7 +127,7 @@ func NewOutboxRunner(d outboxDeps) (*OutboxRunner, error) {
 	o := d.Config.Outbox
 	publisher, err := outboxpub.New(d.Client, d.Store, d.Clock, outboxpub.Settings{
 		Owner: d.Config.App.InstanceID, TopicARN: o.TopicARN, PollInterval: o.PollInterval, ErrorBackoff: o.ErrorBackoff,
-		BatchSize: o.BatchSize, Lease: o.Lease, PublishTimeout: o.PublishTimeout,
+		BatchSize: o.BatchSize, Concurrency: o.Concurrency, Lease: o.Lease, PublishTimeout: o.PublishTimeout,
 		RetryBaseDelay: o.RetryBaseDelay, RetryMaxDelay: o.RetryMaxDelay,
 	}, d.Hooks, d.Metrics, d.Logger)
 	if err != nil {

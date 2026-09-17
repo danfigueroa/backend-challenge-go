@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/danfigueroa/backend-challenge-go/internal/adapter/postgres"
@@ -64,11 +66,13 @@ func run(m *testing.M) int {
 }
 
 type countingSNS struct {
-	inner    outboxpub.SNSAPI
-	mu       sync.Mutex
-	calls    map[string]int
-	failNext atomic.Int32
-	delay    time.Duration
+	inner     outboxpub.SNSAPI
+	mu        sync.Mutex
+	calls     map[string]int
+	sequences map[string][]string
+	failNext  atomic.Int32
+	failEvent string
+	delay     time.Duration
 }
 
 func (c *countingSNS) Publish(ctx context.Context, in *sns.PublishInput, opts ...func(*sns.Options)) (*sns.PublishOutput, error) {
@@ -76,10 +80,14 @@ func (c *countingSNS) Publish(ctx context.Context, in *sns.PublishInput, opts ..
 	if c.calls == nil {
 		c.calls = map[string]int{}
 	}
-	c.calls[aws.ToString(in.MessageDeduplicationId)]++
+	eventID := aws.ToString(in.MessageDeduplicationId)
+	c.calls[eventID]++
 	c.mu.Unlock()
 	if c.delay > 0 {
 		time.Sleep(c.delay)
+	}
+	if eventID == c.failEvent {
+		return nil, errors.New("sns: service unavailable")
 	}
 	if c.failNext.Load() > 0 {
 		c.failNext.Add(-1)
@@ -89,7 +97,20 @@ func (c *countingSNS) Publish(ctx context.Context, in *sns.PublishInput, opts ..
 	if err != nil {
 		return nil, fmt.Errorf("publish: %w", err)
 	}
+	c.mu.Lock()
+	if c.sequences == nil {
+		c.sequences = map[string][]string{}
+	}
+	group := aws.ToString(in.MessageGroupId)
+	c.sequences[group] = append(c.sequences[group], eventID)
+	c.mu.Unlock()
 	return out, nil
+}
+
+func (c *countingSNS) sequence(group string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.sequences[group])
 }
 
 func (c *countingSNS) snapshot() map[string]int {
@@ -116,9 +137,14 @@ func newSetup(t *testing.T) *setup {
 
 func (s *setup) publisher(t *testing.T, owner string, client outboxpub.SNSAPI, lease time.Duration, hooks outboxpub.Hooks) *outboxpub.Publisher {
 	t.Helper()
+	return s.concurrentPublisher(t, owner, client, lease, hooks, 5, 1)
+}
+
+func (s *setup) concurrentPublisher(t *testing.T, owner string, client outboxpub.SNSAPI, lease time.Duration, hooks outboxpub.Hooks, batch, concurrency int) *outboxpub.Publisher {
+	t.Helper()
 	p, err := outboxpub.New(client, s.store, s.Clock, outboxpub.Settings{
 		Owner: owner, TopicARN: s.topic.ARN, PollInterval: 50 * time.Millisecond, ErrorBackoff: 200 * time.Millisecond,
-		BatchSize: 5, Lease: lease, PublishTimeout: 500 * time.Millisecond, RetryBaseDelay: 10 * time.Second, RetryMaxDelay: time.Minute,
+		BatchSize: batch, Concurrency: concurrency, Lease: lease, PublishTimeout: 500 * time.Millisecond, RetryBaseDelay: 10 * time.Second, RetryMaxDelay: time.Minute,
 	}, hooks, metrics.New(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -208,7 +234,7 @@ func TestEventsSurviveCrashBetweenCommitAndPublication(t *testing.T) {
 	restarted := apptest.Attach(t, s.DB)
 	p, err := outboxpub.New(ls.SNS, postgres.NewOutboxRepository(restarted.Pool), restarted.Clock, outboxpub.Settings{
 		Owner: "publisher-after-restart", TopicARN: s.topic.ARN, PollInterval: 50 * time.Millisecond, ErrorBackoff: time.Second,
-		BatchSize: 50, Lease: 30 * time.Second, PublishTimeout: time.Second, RetryBaseDelay: time.Second, RetryMaxDelay: time.Minute,
+		BatchSize: 50, Concurrency: 4, Lease: 30 * time.Second, PublishTimeout: time.Second, RetryBaseDelay: time.Second, RetryMaxDelay: time.Minute,
 	}, outboxpub.Hooks{}, metrics.New(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -332,7 +358,7 @@ func TestFailedPublicationIsRetriedWithBackoff(t *testing.T) {
 	s.OpenWallet(t, "10.00")
 
 	client := &countingSNS{inner: ls.SNS}
-	client.failNext.Store(2)
+	client.failNext.Store(1)
 	p := s.publisher(t, "publisher-retry", client, 30*time.Second, outboxpub.Hooks{})
 
 	if _, err := p.PublishBatch(context.Background()); err != nil {
@@ -385,5 +411,98 @@ func TestShutdownReleasesClaimedEvents(t *testing.T) {
 	drainOutbox(t, other)
 	if n := s.Count(t, "SELECT count(*) FROM outbox_events WHERE published_at IS NULL"); n != 0 {
 		t.Errorf("released events were not taken over immediately: %d left", n)
+	}
+}
+
+func TestPartitionsArePublishedConcurrentlyInOrder(t *testing.T) {
+	s := newSetup(t)
+	const wallets = 8
+	for i := range wallets {
+		w := s.OpenWallet(t, "100.00")
+		s.Process(t, apptest.Input(w, "BET", fmt.Sprintf("bet-%d-a", i), "1.00", ""))
+		s.Process(t, apptest.Input(w, "BET", fmt.Sprintf("bet-%d-b", i), "1.00", ""))
+	}
+	total := s.Count(t, "SELECT count(*) FROM outbox_events")
+
+	const delay = 50 * time.Millisecond
+	client := &countingSNS{inner: ls.SNS, delay: delay}
+	p := s.concurrentPublisher(t, "publisher-parallel", client, 30*time.Second, outboxpub.Hooks{}, total, wallets)
+
+	started := time.Now()
+	if _, err := p.PublishBatch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(started)
+	if sequential := time.Duration(total) * delay; elapsed > sequential/2 {
+		t.Errorf("batch of %d events took %v; sequential publication would take %v", total, elapsed, sequential)
+	}
+	if n := s.Count(t, "SELECT count(*) FROM outbox_events WHERE published_at IS NULL"); n != 0 {
+		t.Fatalf("unpublished events = %d", n)
+	}
+
+	rows, err := s.DB.OwnerPool.Query(context.Background(), "SELECT partition_key, id::text FROM outbox_events ORDER BY occurred_at, id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := map[string][]string{}
+	for rows.Next() {
+		var key, id string
+		if err := rows.Scan(&key, &id); err != nil {
+			t.Fatal(err)
+		}
+		expected[key] = append(expected[key], id)
+	}
+	rows.Close()
+	if len(expected) != wallets {
+		t.Fatalf("partitions = %d, want %d", len(expected), wallets)
+	}
+	for key, want := range expected {
+		if got := client.sequence(key); !slices.Equal(got, want) {
+			t.Errorf("partition %s published as %v, want commit order %v", key, got, want)
+		}
+	}
+}
+
+func TestFailedPublicationPostponesOnlyItsPartition(t *testing.T) {
+	s := newSetup(t)
+	blocked := s.OpenWallet(t, "100.00")
+	s.Process(t, apptest.Input(blocked, "BET", "bet-blocked", "1.00", ""))
+	for range 3 {
+		s.OpenWallet(t, "100.00")
+	}
+
+	var first string
+	if err := s.DB.OwnerPool.QueryRow(context.Background(),
+		"SELECT id::text FROM outbox_events WHERE partition_key = $1 ORDER BY occurred_at, id LIMIT 1", blocked.ID.String()).Scan(&first); err != nil {
+		t.Fatal(err)
+	}
+	client := &countingSNS{inner: ls.SNS, failEvent: first}
+	p := s.concurrentPublisher(t, "publisher-postponing", client, 30*time.Second, outboxpub.Hooks{}, 50, 4)
+	if _, err := p.PublishBatch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := s.Count(t, "SELECT count(*) FROM outbox_events WHERE partition_key <> $1 AND published_at IS NULL", blocked.ID.String()); n != 0 {
+		t.Errorf("other partitions left %d events unpublished", n)
+	}
+	if n := s.Count(t, "SELECT count(*) FROM outbox_events WHERE partition_key = $1 AND published_at IS NULL AND locked_by IS NULL AND next_attempt_at > now()", blocked.ID.String()); n != 4 {
+		t.Errorf("blocked partition events rescheduled = %d, want all 4", n)
+	}
+	if n := s.Count(t, "SELECT count(*) FROM outbox_events WHERE partition_key = $1 AND last_error LIKE 'waiting for preceding event ' || $2 || '%'", blocked.ID.String(), first); n != 3 {
+		t.Errorf("followers postponed behind the failed event = %d, want 3", n)
+	}
+	calls := client.snapshot()
+	rows, err := s.DB.OwnerPool.Query(context.Background(), "SELECT id::text FROM outbox_events WHERE partition_key = $1", blocked.ID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		if want := map[bool]int{true: 1, false: 0}[id == first]; calls[id] != want {
+			t.Errorf("event %s of the blocked partition was sent %d times, want %d", id, calls[id], want)
+		}
 	}
 }
