@@ -154,7 +154,7 @@ Legenda: ✅ atendido e verificado · ◐ atendido com limitação documentada
 | X1 | `README.md`: pré-requisitos, variáveis, filas, migrations, execução, exemplos de chamadas e testes | ✅ |
 | X2 | `ARCHITECTURE.md` com dinheiro, transações, idempotência, locks, pendências, reversões, inbox/outbox, auth, Fx, shutdown, limitações e trabalho não concluído | ✅ |
 | X3 | `.env.example` com valores locais, sem segredos reais | ✅ |
-| X4 | `docker compose up --build`, `go test ./...`, `go test -race ./...`, `go vet ./...` | ✅ |
+| X4 | `docker compose up --build`, `go test ./...`, `go test -race ./...`, `go vet ./...` (verificados também no GitHub Actions em runner Linux limpo, ver README › Integração contínua) | ✅ |
 | X5 | Instruções separadas para dependências de teste, integração, multi-instância e falhas, com build tags | ✅ |
 | X6 | Código formatado com `gofmt`, dependências reproduzíveis (`go.sum`, `go mod verify`) | ✅ |
 | X7 | Provisionamento automático do IdP, identidades de teste e fluxos autenticados documentados | ✅ |
