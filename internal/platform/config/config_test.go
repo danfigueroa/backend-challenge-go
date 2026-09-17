@@ -12,15 +12,26 @@ import (
 
 func setAuth(t *testing.T) {
 	t.Helper()
+	t.Setenv("SQS_INPUT_QUEUE_URL", "http://localstack:4566/000000000000/wager-transactions.fifo")
+	t.Setenv("SQS_DLQ_URL", "http://localstack:4566/000000000000/wager-transactions-dlq.fifo")
+	t.Setenv("SNS_EVENTS_TOPIC_ARN", "arn:aws:sns:us-east-1:000000000000:wallet-events.fifo")
 	t.Setenv("AUTH_ISSUER", "http://keycloak:8080/realms/wagering")
 	t.Setenv("AUTH_JWKS_URL", "http://keycloak:8080/realms/wagering/protocol/openid-connect/certs")
 }
 
 func TestAuthIsOnlyRequiredForTheAPIRole(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://u:p@db:5432/wallet")
-	t.Setenv("APP_ROLES", "consumer,outbox")
+	t.Setenv("APP_ROLES", "pendingref")
 	if _, err := config.Load(); err != nil {
-		t.Errorf("worker-only instance must not require auth settings: %v", err)
+		t.Errorf("worker-only instance must not require auth or messaging settings: %v", err)
+	}
+	t.Setenv("APP_ROLES", "consumer")
+	if _, err := config.Load(); err == nil {
+		t.Error("consumer instance without queue settings accepted")
+	}
+	t.Setenv("APP_ROLES", "outbox")
+	if _, err := config.Load(); err == nil {
+		t.Error("outbox instance without topic ARN accepted")
 	}
 	t.Setenv("APP_ROLES", "api")
 	if _, err := config.Load(); err == nil {
