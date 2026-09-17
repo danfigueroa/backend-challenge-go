@@ -385,3 +385,98 @@ func TestComposeInstancesShareState(t *testing.T) {
 		t.Fatalf("reconciliation: %d %s", r.status, r.raw)
 	}
 }
+
+func TestDatabaseOutageIsReportedAndRecoveredWithoutDuplicates(t *testing.T) {
+	e := newEnv(t)
+	database := e.proxyDatabase(t)
+	slowRetries := map[string]string{"SQS_RETRY_BASE_DELAY": "2s", "SQS_RETRY_MAX_DELAY": "8s", "SQS_PROCESSING_TIMEOUT": "3s"}
+	nodes := []*Instance{e.start("node-1", allRoles, slowRetries), e.start("node-2", allRoles, slowRetries)}
+	w := openWallet(t, nodes[0].api, "100.00")
+
+	database.cut()
+	eventually(t, "readiness to report the database outage", func() bool {
+		return nodes[0].ready(t) == http.StatusServiceUnavailable && nodes[1].ready(t) == http.StatusServiceUnavailable
+	})
+	during := submit(t, nodes[1].api, w, "BET", "bet-during-outage", "30.00", "")
+	if during.status != http.StatusServiceUnavailable || during.header.Get("Retry-After") == "" {
+		t.Fatalf("bet during outage: %d %v %s", during.status, during.header, during.raw)
+	}
+	e.send(t, w, "msg-during-outage", sqsBet(w, "msg-during-outage", "sqs-bet-during-outage", "20.00"))
+	time.Sleep(3 * time.Second)
+
+	database.restore()
+	eventually(t, "readiness to recover", func() bool {
+		return nodes[0].ready(t) == http.StatusOK && nodes[1].ready(t) == http.StatusOK
+	})
+	retried := submit(t, nodes[0].api, w, "BET", "bet-during-outage", "30.00", "")
+	if retried.status != http.StatusOK || retried.body["idempotentReplay"] != false {
+		t.Fatalf("client retry after recovery: %d %s", retried.status, retried.raw)
+	}
+	eventually(t, "message retried after the outage to be consumed", func() bool {
+		return e.queueDepth(t, e.queueURL) == 0
+	})
+
+	if retries := nodes[0].metric(t, `wallet_sqs_messages_total{queue="wager-transactions-consumer",result="RETRY"}`) +
+		nodes[1].metric(t, `wallet_sqs_messages_total{queue="wager-transactions-consumer",result="RETRY"}`); retries == 0 {
+		t.Error("the consumer never retried the message during the outage")
+	}
+	if n := e.queueDepth(t, e.dlqURL); n != 0 {
+		t.Fatalf("dlq depth = %d; a temporary outage must not dead-letter messages", n)
+	}
+	if n := e.count(t, "SELECT balance_minor FROM wallets WHERE id = $1", w.ID); n != 5000 {
+		t.Fatalf("balance = %d, want 5000", n)
+	}
+	if n := e.count(t, "SELECT count(*) FROM ledger_entries WHERE wallet_id = $1 AND direction = 'DEBIT'", w.ID); n != 2 {
+		t.Fatalf("debits = %d, want 2", n)
+	}
+	eventually(t, "outbox to drain after the outage", func() bool {
+		return e.count(t, "SELECT count(*) FROM outbox_events WHERE published_at IS NULL") == 0
+	})
+	e.assertFinancialConsistency(t)
+}
+
+func TestBrokerOutageDelaysMessagingWithoutLosingEvents(t *testing.T) {
+	e := newEnv(t)
+	broker := e.proxyBroker(t)
+	node := e.start("node-1", allRoles, map[string]string{"AWS_HEALTH_TIMEOUT": "1s"})
+	w := openWallet(t, node.api, "100.00")
+
+	broker.cut()
+	eventually(t, "readiness to report the broker outage", func() bool {
+		return node.ready(t) == http.StatusServiceUnavailable
+	})
+	if r := submit(t, node.api, w, "BET", "bet-broker-outage", "10.00", ""); r.status != http.StatusOK {
+		t.Fatalf("HTTP must keep working while the broker is down: %d %s", r.status, r.raw)
+	}
+	e.send(t, w, "msg-broker-outage", sqsBet(w, "msg-broker-outage", "sqs-bet-broker-outage", "15.00"))
+	time.Sleep(3 * time.Second)
+	if n := e.count(t, "SELECT count(*) FROM wager_transactions WHERE external_transaction_id = 'sqs-bet-broker-outage'"); n != 0 {
+		t.Fatalf("message consumed while the broker was unreachable")
+	}
+	pending := e.count(t, "SELECT count(*) FROM outbox_events WHERE published_at IS NULL")
+	if pending == 0 {
+		t.Fatal("events were published while the broker was unreachable")
+	}
+
+	broker.restore()
+	eventually(t, "readiness to recover", func() bool { return node.ready(t) == http.StatusOK })
+	eventually(t, "message to be consumed after recovery", func() bool { return e.queueDepth(t, e.queueURL) == 0 })
+	eventually(t, "outbox to drain after recovery", func() bool {
+		return e.count(t, "SELECT count(*) FROM outbox_events WHERE published_at IS NULL") == 0
+	})
+
+	total := e.count(t, "SELECT count(*) FROM outbox_events")
+	events := e.auditEvents(t, total, 20*time.Second)
+	if len(events) != total {
+		t.Fatalf("audited events = %d, want %d", len(events), total)
+	}
+	for id, deliveries := range events {
+		if deliveries != 1 {
+			t.Errorf("event %s delivered %d times", id, deliveries)
+		}
+	}
+	if n := e.count(t, "SELECT balance_minor FROM wallets WHERE id = $1", w.ID); n != 7500 {
+		t.Fatalf("balance = %d, want 7500", n)
+	}
+	e.assertFinancialConsistency(t)
+}
