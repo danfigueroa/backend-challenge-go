@@ -147,7 +147,7 @@ func (s *Service) markFailed(ctx context.Context, claim app.PendingClaim, cause 
 			return err
 		}
 		failed = t
-		return nil
+		return s.wakeWaitingOn(ctx, t, s.clock.Now())
 	})
 	if err != nil {
 		return err

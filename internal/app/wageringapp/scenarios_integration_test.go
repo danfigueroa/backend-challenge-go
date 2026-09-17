@@ -202,6 +202,35 @@ func TestReversalArrivingBeforeReferenceIsResolvedLater(t *testing.T) {
 	h.AssertAllWalletsReconcile(t)
 }
 
+func TestReversalWaitingOnRejectedReferenceIsWokenAndRejected(t *testing.T) {
+	t.Parallel()
+	h := apptest.New(t, pg)
+	ctx := context.Background()
+	w := h.OpenWallet(t, "10.00")
+
+	refund := h.Process(t, apptest.Input(w, "REFUND", "refund-early", "40.00", "bet-unfunded"))
+	if refund.Transaction.Status() != wagering.StatusPendingReference {
+		t.Fatalf("refund status = %s", refund.Transaction.Status())
+	}
+	bet := h.Process(t, apptest.Input(w, "BET", "bet-unfunded", "40.00", ""))
+	if bet.Transaction.FailureCode() != wagering.CodeInsufficientFunds {
+		t.Fatalf("bet = %s %s", bet.Transaction.Status(), bet.Transaction.FailureCode())
+	}
+
+	stats, err := h.Wagering.ResolveDuePending(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Claimed != 1 || stats.Rejected != 1 {
+		t.Fatalf("stats = %+v (the rejected bet should have woken the refund immediately)", stats)
+	}
+	resolved, err := h.Wagering.GetByExternalID(ctx, apptest.ProviderA, "provider-a", "refund-early")
+	if err != nil || resolved.Status() != wagering.StatusRejected || resolved.FailureCode() != wagering.CodeReferenceNotProcessed {
+		t.Fatalf("resolved = %+v, %v", resolved, err)
+	}
+	h.AssertAllWalletsReconcile(t)
+}
+
 func resolvedBalance(tx *wagering.Transaction) string {
 	r, _ := tx.Result()
 	return r.Balance.Amount()

@@ -144,10 +144,18 @@ func (s *Service) persistDecision(ctx context.Context, meta app.Metadata, t *wag
 	if err := s.outbox.Append(ctx, at, events...); err != nil {
 		return err
 	}
-	if d.Outcome == wagering.OutcomeProcessed {
-		if _, err := s.transactions.WakeWaitingOn(ctx, t.ProviderID(), t.ExternalTransactionID(), at); err != nil {
-			return err
-		}
+	if t.Status().IsTerminal() {
+		return s.wakeWaitingOn(ctx, t, at)
+	}
+	return nil
+}
+
+func (s *Service) wakeWaitingOn(ctx context.Context, t *wagering.Transaction, at time.Time) error {
+	if t.Origin() != wagering.OriginExternal {
+		return nil
+	}
+	if _, err := s.transactions.WakeWaitingOn(ctx, t.ProviderID(), t.ExternalTransactionID(), at); err != nil {
+		return fmt.Errorf("wake transactions waiting on %s: %w", t.ID(), err)
 	}
 	return nil
 }
