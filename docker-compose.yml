@@ -167,5 +167,31 @@ services:
     depends_on:
       - prometheus
 
+  k6:
+    image: grafana/k6:2.2.0
+    profiles: ["load"]
+    command: ["run", "--summary-export=/results/summary.json", "/scripts/wagering.js"]
+    environment:
+      API_URLS: http://app-1:8080,http://app-2:8080,http://app-3:8080
+      KEYCLOAK_URL: http://keycloak:8080
+      PROMETHEUS_URL: http://prometheus:9090
+      LOCALSTACK_URL: http://localstack:4566
+      RATE: ${LOAD_RATE:-50}
+      HOT_VUS: ${LOAD_HOT_VUS:-10}
+      DURATION: ${LOAD_DURATION:-2m}
+      WALLETS: ${LOAD_WALLETS:-200}
+    volumes:
+      - ./test/load:/scripts:ro
+      - ./test/load/results:/results
+    depends_on:
+      app-1:
+        condition: service_healthy
+      app-2:
+        condition: service_healthy
+      app-3:
+        condition: service_healthy
+      prometheus:
+        condition: service_started
+
 volumes:
   postgres-data:
