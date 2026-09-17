@@ -28,6 +28,9 @@ Regra de dependência: `domain` ← `app` ← `adapter`/`worker` ← `fxapp` ←
 | Banco | `pgx/v5` com SQL explícito, `golang-migrate`, PostgreSQL 18 | [Persistência](#persistência) |
 | Idempotência | Chave + hash persistidos, replay sem lock, double-check sob lock, unicidade como rede final | [Idempotência](#idempotência) |
 | Autorização | Verificada também nos casos de uso via `app.Actor` | [Casos de uso](#casos-de-uso) |
+| IdP | Keycloak 26.7.4, `client_credentials`, realm importado automaticamente | [Autenticação e autorização](#autenticação-e-autorização) |
+| Permissões | Roles do realm por capacidade na borda + `app.Actor` nos casos de uso; `provider_id` vem do token | [Modelo de permissões](#modelo-de-permissões) |
+| Contrato HTTP | 200/202/422 para resultado da operação; problem+json para 400/401/403/404/409/413/415/503 | [Contrato HTTP](#contrato-http) |
 | Composição | Uber Fx com módulos por camada e papéis por instância (`APP_ROLES`) | [Uso do Fx e shutdown](#uso-do-fx-e-shutdown) |
 | Observabilidade | `slog` JSON com campos de contexto, Prometheus em porta administrativa, OpenTelemetry opcional | [Observabilidade](#observabilidade) |
 | Invariantes | Constraints, FKs compostas, índices parciais, triggers e constraint triggers adiados; aplicação sem `UPDATE`/`DELETE` no ledger | [Invariantes impostas pelo banco](#invariantes-impostas-pelo-banco) |
@@ -560,7 +563,132 @@ _Inbox, outbox e consumidor serão detalhados na Fase 6._
 
 ## Autenticação e autorização
 
-_A preencher na Fase 5._
+### Escolha do IdP
+
+**Keycloak 26.7.4** (OAuth 2.0/OIDC), recomendado pelo enunciado. Os motivos:
+
+- implementação madura de `client_credentials` para comunicação entre serviços;
+- JWKS com rotação de chaves;
+- mappers declarativos para audience e claims customizadas;
+- realm inteiro versionado em JSON e importado automaticamente na inicialização (`deploy/keycloak/realm-wagering.json`), sem passos manuais.
+
+O serviço não cadastra senhas nem emite tokens.
+
+### Identidades provisionadas
+
+| Client (`client_credentials`) | `provider_id` | Roles | Uso |
+|---|---|---|---|
+| `provider-a` | `provider-a` | `wagering:transactions:write`, `wagering:transactions:read` | Provedor de jogos A |
+| `provider-b` | `provider-b` | idem | Provedor de jogos B (testes de isolamento) |
+| `wallet-internal` | — | `wallets:write`, `wallets:read`, `wallets:reconcile`, `wagering:transactions:read` | Serviço interno de carteiras |
+| `provider-a-short-lived` | `provider-a` | provedor | Token de 2 s (teste de expiração) |
+| `provider-unprivileged` | `provider-a` | nenhuma | Autenticado sem permissão (403) |
+| `foreign-audience` | `provider-a` | provedor | Token **sem** audience `wallet-api` (401) |
+
+Os segredos (`<client>-local-secret`) servem apenas para o ambiente local.
+
+O scope `wallet-api` adiciona três mappers:
+- a audience `wallet-api`;
+- o `sub`;
+- as roles do realm em `realm_access.roles`.
+
+O `provider_id` é uma claim fixa por client: **a identidade autenticada determina o provedor**, não o corpo da requisição.
+
+### Validação de credenciais
+
+`internal/adapter/auth` usa `coreos/go-oidc` sem discovery, com emissor e JWKS configurados separadamente (`AUTH_ISSUER`, `AUTH_JWKS_URL`). Isso permite que o serviço busque as chaves pela rede interna do Docker enquanto o `iss` dos tokens reflete o endereço público do Keycloak.
+
+| Verificação | Resultado se falhar |
+|---|---|
+| Header `Authorization: Bearer <jwt>` presente | 401 `UNAUTHENTICATED` |
+| Assinatura RS256 com chave do JWKS (cache e busca de novas chaves quando o `kid` é desconhecido) | 401 `INVALID_TOKEN` |
+| Algoritmo na allowlist (`RS256`); `none`/HS/PS rejeitados | 401 `INVALID_TOKEN` |
+| `iss` igual a `AUTH_ISSUER` | 401 `INVALID_TOKEN` |
+| `aud` contém `AUTH_AUDIENCE` (`wallet-api`) | 401 `INVALID_TOKEN` |
+| `exp` no futuro | 401 `TOKEN_EXPIRED` |
+| `sub` e `azp` presentes | 401 `INVALID_TOKEN` |
+| JWKS inacessível | 503 `SERVICE_UNAVAILABLE` (falha do IdP não é tratada como credencial inválida) |
+
+O `go-oidc` formata erros de assinatura com `%v`, o que perde a causa original. Um `KeySet` envolvente marca, num registro ligado ao contexto da verificação, quando a falha foi ao buscar chaves; assim a indisponibilidade do IdP vira 503.
+
+### Modelo de permissões
+
+Duas camadas independentes:
+
+1. **Borda HTTP (roles)**: cada rota exige uma role do realm.
+
+| Rota | Role exigida |
+|---|---|
+| `POST /wagering/transactions` | `wagering:transactions:write` |
+| `GET /wagering/transactions/{id}`, `GET /providers/{providerId}/wagering/transactions/{externalId}` | `wagering:transactions:read` |
+| `POST /wallets` | `wallets:write` |
+| `GET /wallets/{id}`, `GET /wallets/{id}/ledger` | `wallets:read` |
+| `POST /wallets/{id}/reconciliation` | `wallets:reconcile` |
+| `GET /health/live`, `GET /health/ready` | pública |
+
+2. **Casos de uso (`app.Actor`)**: o token vira um actor.
+
+| Token | Actor | Pode |
+|---|---|---|
+| Com claim `provider_id` | `PROVIDER` | agir e ler **somente** o próprio `providerId`; tokens de provedor nunca viram `SERVICE`, mesmo que recebam roles de carteira por engano |
+| Sem `provider_id` e com role de carteira | `SERVICE` | operações de carteira e leitura de qualquer transação |
+| Demais | sem privilégio | nada |
+
+Consequências verificadas em teste com Keycloak real:
+- provedor B enviando o corpo do provedor A (inclusive como replay): 403, sem efeito financeiro;
+- provedor B consultando por ID uma transação do provedor A: 404, sem revelar que ela existe;
+- provedor B consultando o namespace do provedor A: 403;
+- provedores acessando carteiras ou reconciliação: 403;
+- o serviço interno não consegue criar transações de aposta (403).
+
+Nenhuma requisição rejeitada por autenticação ou autorização chega a gravar dados.
+
+## Contrato HTTP
+
+Todas as respostas são JSON. Erros usam **RFC 9457** (`application/problem+json`) com `type`, `title`, `status`, `code`, `detail`, `field` (quando aplicável), `instance` e `correlationId`. O header `X-Correlation-Id` é aceito (até 128 caracteres ASCII visíveis) ou gerado, sempre devolvido e propagado para logs e eventos.
+
+### `POST /wagering/transactions`
+
+| Situação | Status | Corpo |
+|---|---|---|
+| Processada (nova ou replay) | **200** | `{transactionId, status: "PROCESSED", balance, idempotentReplay}` |
+| Aguardando referência | **202** + `Location` | `{transactionId, status: "PENDING_REFERENCE", idempotentReplay, nextAttemptAt, expiresAt}` |
+| Rejeição de negócio persistida (ou replay dela) | **422** | `{transactionId, status: "REJECTED", failureCode, balance (observado), idempotentReplay}` |
+| Entrada inválida, `Idempotency-Key` ausente, JSON malformado/campo desconhecido, carteira inexistente ou divergente | **400** | problem com `code` corrigível (`MISSING_FIELD`, `INVALID_AMOUNT`, `MALFORMED_REQUEST`, `WALLET_NOT_FOUND`, ...); **nada é persistido** e a chave pode ser reutilizada |
+| Token ausente, inválido ou expirado | **401** + `WWW-Authenticate` | `UNAUTHENTICATED`, `INVALID_TOKEN`, `TOKEN_EXPIRED` |
+| Sem permissão ou provedor diferente do token | **403** | `INSUFFICIENT_PERMISSIONS`, `FORBIDDEN` |
+| Chave reutilizada com outro conteúdo / mesmo ID externo com outra chave | **409** | `IDEMPOTENCY_KEY_CONFLICT`, `EXTERNAL_TRANSACTION_CONFLICT` + `existingTransactionId` |
+| Corpo acima de `HTTP_MAX_BODY_BYTES` | **413** | `PAYLOAD_TOO_LARGE` |
+| `Content-Type` diferente de `application/json` | **415** | `UNSUPPORTED_MEDIA_TYPE` |
+| Banco/IdP indisponível, timeout ou retries esgotados | **503** + `Retry-After` | `SERVICE_UNAVAILABLE`; reenviar com a **mesma** chave é seguro |
+| Erro inesperado | **500** | `INTERNAL_ERROR` (detalhe apenas no log) |
+
+Regras de entrada:
+- corpo JSON único, sem campos desconhecidos e sem dados após o objeto;
+- `amount` precisa ser string: números JSON são rejeitados;
+- UUIDs de path precisam estar na forma canônica e não podem ser nulos.
+
+### Demais rotas
+
+| Rota | Sucesso | Erros específicos |
+|---|---|---|
+| `POST /wallets` | 201 + `Location`, `{id, playerId, balance, version, createdAt, updatedAt}` | 409 `WALLET_ALREADY_EXISTS` |
+| `GET /wallets/{walletId}` | 200 | 404 |
+| `GET /wallets/{walletId}/ledger?cursor=&limit=` | 200 `{walletId, entries[], nextCursor?}` (limite padrão 50, máximo 200) | 400 `INVALID_CURSOR` |
+| `POST /wallets/{walletId}/reconciliation` | 200 `{walletId, storedBalance, calculatedBalance, difference, consistent, checkedEntries, walletVersion, ledgerVersion, chainBreaks, checkedAt}` | 404 |
+| `GET /wagering/transactions/{transactionId}` | 200 com a transação completa (estado, códigos, resultado, agendamento) | 404 (também para transações de outro provedor) |
+| `GET /providers/{providerId}/wagering/transactions/{externalTransactionId}` | 200 | 403 para outro provedor, 404 |
+
+### Camadas do handler
+
+Ordem por requisição:
+1. recuperação de panic e correlation ID;
+2. span OpenTelemetry por rota;
+3. instrumentação: métrica por rota e status, log de acesso com `clientId`/`providerId` e recuperação que ainda registra o 500;
+4. autenticação e checagem de role;
+5. timeout da requisição (`HTTP_REQUEST_TIMEOUT`);
+6. validação de `Content-Type` e limite de corpo;
+7. handler.
 
 ## Uso do Fx e shutdown
 
@@ -571,6 +699,7 @@ Pacote `internal/fxapp`. O binário `cmd/wallet` carrega e valida a configuraç�
 | `observability` | `*slog.Logger`, `*metrics.Metrics`, `app.Observer`, `*tracing.Provider`, `*health.Checker` | `OnStop`: flush/shutdown do tracer |
 | `postgres` | `postgres.Config`, `*pgxpool.Pool`, `app.TxManager`, repositórios (anotados como interfaces com `fx.As`) | `OnStart`: ping com retry até o prazo de start; `OnStop`: fecha o pool |
 | `application` | `app.Clock`, `app.IDGenerator`, `*walletapp.Service`, `*wageringapp.Service` | — |
+| `api` (papel `api`) | `*auth.Verifier`, servidor HTTP da API pública | `OnStart`: `net.Listen` síncrono; `OnStop`: `Shutdown` aguardando requisições em andamento |
 | `admin` | servidor HTTP administrativo (`/metrics`, `/health/live`, `/health/ready`) | `OnStart`: `net.Listen` síncrono (falha rápido); `OnStop`: `Shutdown` gracioso |
 | `pending-references` (papel `pendingref`) | `worker.Runner` do resolvedor | `OnStart`: inicia o loop; `OnStop`: cancela e aguarda término com prazo |
 
@@ -581,8 +710,8 @@ Pacote `internal/fxapp`. O binário `cmd/wallet` carrega e valida a configuraç�
 O Fx executa os hooks `OnStop` na ordem inversa dos `OnStart`. Como cada componente depende do que usa, a ordem é garantida pelo próprio grafo:
 
 ```
-start:  tracer → pool (ping) → servidor admin → workers → [hook de drain]
-stop:   drain (readiness = DOWN) → workers → servidor admin → pool → tracer
+start:  tracer → pool (ping) → servidor admin → servidor API → workers → [hook de drain]
+stop:   drain (readiness = DOWN) → workers → servidor API → servidor admin → pool → tracer
 ```
 
 1. **Drain**: o último hook registrado (`registerDrain`) é o primeiro a parar e faz `/health/ready` responder `503`, tirando a instância do balanceamento antes de interromper qualquer coisa.
@@ -657,7 +786,7 @@ OpenTelemetry com exportador OTLP/HTTP (`OTEL_TRACES_ENABLED=true`), propagaçã
 | `GET /health/live` | processo ativo (sempre `200` enquanto o servidor responde) |
 | `GET /health/ready` | `200` se todas as dependências respondem (PostgreSQL agora, SQS na Fase 6); `503` com detalhe por dependência caso contrário, ou durante o drain do shutdown |
 
-Os checks rodam em paralelo, com timeout individual (`DATABASE_HEALTH_TIMEOUT`) e cache de 1 s para que probes frequentes não sobrecarreguem o banco. Nesta fase os endpoints estão no servidor administrativo; na Fase 5 também serão expostos na API pública.
+Os checks rodam em paralelo, com timeout individual (`DATABASE_HEALTH_TIMEOUT`) e cache de 1 s para que probes frequentes não sobrecarreguem o banco. Os endpoints são expostos na API pública (sem autenticação) e no servidor administrativo.
 
 ## Limitações e interpretações
 
@@ -667,5 +796,7 @@ Os checks rodam em paralelo, com timeout individual (`DATABASE_HEALTH_TIMEOUT`) 
 - **Reversão única por transação**: um `ROLLBACK` de `REFUND` não reabre a `BET` para nova devolução.
 - **Custo das verificações adiadas**: os constraint triggers executam algumas leituras por linha alterada no commit. É um custo deliberado em troca de integridade garantida pelo banco; em volumes muito altos poderia ser substituído por reconciliação contínua.
 - **Superusuário**: triggers protegem contra `UPDATE`/`DELETE`/`TRUNCATE` inclusive do dono do schema, mas um superusuário pode desabilitá-los (`session_replication_role`, `ALTER TABLE ... DISABLE TRIGGER`). Em produção o dono do schema não deve ser superusuário e o acesso administrativo deve ser auditado. No ambiente local o `POSTGRES_USER` do container é superusuário por conveniência.
+- **Tokens de provedor com roles de carteira** são tratados como provedor (menor privilégio). Revogação imediata de tokens não é suportada: a validação é local via JWKS, e a expiração curta limita a janela.
+- **Readiness não inclui o Keycloak**: o enunciado pede PostgreSQL e SQS. A indisponibilidade do IdP aparece como 503 nas requisições autenticadas.
 - **Aleatoriedade**: `math/rand/v2` é usado apenas para jitter de backoff; por isso a regra G404 do gosec está desabilitada. Identificadores usam UUIDv7 (`crypto/rand`).
 - **Retenção da outbox**: eventos publicados podem ser apagados (o trigger só retém os não publicados), mas o job de retenção não faz parte do escopo.
