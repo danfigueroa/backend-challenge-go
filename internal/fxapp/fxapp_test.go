@@ -12,6 +12,8 @@ import (
 func baseConfig(t *testing.T, roles ...config.Role) config.Config {
 	t.Setenv("DATABASE_URL", "postgres://user:pass@127.0.0.1:1/wallet")
 	t.Setenv("APP_INSTANCE_ID", "validate")
+	t.Setenv("AUTH_ISSUER", "http://keycloak.test/realms/wagering")
+	t.Setenv("AUTH_JWKS_URL", "http://keycloak.test/realms/wagering/protocol/openid-connect/certs")
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatal(err)

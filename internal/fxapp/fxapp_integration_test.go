@@ -42,6 +42,8 @@ func integrationConfig(t *testing.T, databaseURL string) config.Config {
 	t.Setenv("PENDING_ERROR_BACKOFF", "200ms")
 	t.Setenv("PENDING_ITERATION_TIMEOUT", "5s")
 	t.Setenv("APP_SHUTDOWN_TIMEOUT", "10s")
+	t.Setenv("AUTH_ISSUER", "http://keycloak.test/realms/wagering")
+	t.Setenv("AUTH_JWKS_URL", "http://127.0.0.1:1/certs")
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatal(err)
