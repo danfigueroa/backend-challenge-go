@@ -8,8 +8,8 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 
 | # | Critério eliminatório | Implementação | Evidência | Status |
 |---|---|---|---|---|
-| E1 | Autenticação efetiva nos endpoints de negócio | | | ⏳ |
-| E2 | Sem acesso não autorizado a operações/transações | Casos de uso: `app.Actor` (HTTP na Fase 5) | `TestProviderIsolation`, `TestActorAuthorization`, `TestOpenWalletConflictAndValidation` | 🚧 |
+| E1 | Autenticação efetiva nos endpoints de negócio | `internal/adapter/auth`, `httpapi.authenticate` | `TestAuthenticationAgainstRealKeycloak`, `TestProcessTransactionErrors` | ✅ |
+| E2 | Sem acesso não autorizado a operações/transações | Roles na borda + `app.Actor` nos casos de uso | `TestProviderIsolationOverHTTP`, `TestProviderIsolation`, `TestActorAuthorization` | ✅ |
 | E3 | Sem cálculo monetário em ponto flutuante | `internal/domain/money`; `forbidigo` | `make lint`, `FuzzParse` | 🚧 |
 | E4 | Sem saldo negativo por concorrência | Lock por carteira + `CHECK` | `TestTwoConcurrentBetsOfEightyOnHundred`, `TestDistinctWalletsAreProcessedInParallel` | 🚧 |
 | E5 | Sem movimentação duplicada | Idempotência + inbox + unicidades | `TestSameBetFiftyTimesInParallelDebitsOnce`, `TestConcurrentHTTPAndSQSForTheSameOperation` | 🚧 |
@@ -66,22 +66,22 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 
 | # | Requisito | Implementação | Evidência | Status |
 |---|---|---|---|---|
-| H1 | `POST /wallets` com OPENING, ledger e outbox atômicos; conflito em duplicata | Caso de uso `OpenWallet` (HTTP na Fase 5) | `TestOpenWallet*` | 🚧 |
-| H2 | `GET /wallets/:id` | | | ⏳ |
-| H3 | `GET /wallets/:id/ledger` com cursor opaco | Caso de uso `ListLedger` (cursor base64url vinculado à carteira) | `TestGetWalletAndLedgerPagination`, `TestCursorRejectsTampering` | 🚧 |
-| H4 | `GET /wagering/transactions/:id` | | | ⏳ |
-| H5 | `GET /providers/:providerId/wagering/transactions/:externalId` | | | ⏳ |
-| H6 | `POST /wagering/transactions` com `Idempotency-Key` obrigatório | | | ⏳ |
+| H1 | `POST /wallets` com OPENING, ledger e outbox atômicos; conflito em duplicata | `walletapp.OpenWallet`, `httpapi.openWallet` | `TestOpenWallet*`, `TestHTTPContractEndToEnd` | ✅ |
+| H2 | `GET /wallets/:id` | `httpapi.getWallet` | `TestWalletEndpoints`, `TestHTTPContractEndToEnd` | ✅ |
+| H3 | `GET /wallets/:id/ledger` com cursor opaco | `ListLedger` + `httpapi.listLedger` | `TestGetWalletAndLedgerPagination`, `TestHTTPContractEndToEnd` | ✅ |
+| H4 | `GET /wagering/transactions/:id` | `httpapi.getTransaction` | `TestTransactionQueries`, `TestProviderIsolationOverHTTP` | ✅ |
+| H5 | `GET /providers/:providerId/wagering/transactions/:externalId` | `httpapi.getByExternalID` | `TestTransactionQueries`, `TestProviderIsolationOverHTTP` | ✅ |
+| H6 | `POST /wagering/transactions` com `Idempotency-Key` obrigatório | `httpapi.processTransaction` | `TestProcessTransactionErrors/missing_idempotency_key`, `TestHTTPContractEndToEnd` | ✅ |
 | H7 | Hash canônico e equivalência HTTP/SQS | `wagering.NewRequest` usado pelas duas portas | `TestCanonicalPayloadGolden`, `TestSQSDeliveriesAreDeduplicatedByInboxAndIdempotency` | 🚧 |
-| H8 | Replay devolve saldo original com `idempotentReplay: true` | `ProcessResult.IdempotentReplay` + resultado persistido | `TestBetIsProcessedAndReplayReturnsOriginalBalance` | 🚧 |
-| H9 | Conflitos de chave e de `(providerId, externalTransactionId)` | `IdempotencyConflictError` | `TestIdempotencyConflicts` | 🚧 |
-| H10 | Códigos HTTP distinguíveis documentados | | | ⏳ |
-| H11 | `POST /wallets/:id/reconciliation` | Caso de uso `Reconcile` (snapshot read-only) | `TestReconciliation*`, `TestBuildReport` | 🚧 |
-| H12 | `/health/live` e `/health/ready` | `internal/platform/health` (admin; API pública na Fase 5; SQS na Fase 6) | `health_test.go`, `TestApplicationStartsServesAndStopsCleanly` | 🚧 |
-| A1 | IdP OIDC externo (Keycloak) provisionado automaticamente | | | ⏳ |
-| A2 | `providerId` determinado pela identidade | | | ⏳ |
-| A3 | Isolamento entre provedores (consultas e replays) | `app.Actor` nos casos de uso | `TestProviderIsolation` | 🚧 |
-| A4 | Operações de carteira restritas ao serviço interno | `RequireInternalService` | `TestOpenWalletConflictAndValidation`, `TestGetWalletAndLedgerPagination` | 🚧 |
+| H8 | Replay devolve saldo original com `idempotentReplay: true` | Resultado persistido | `TestBetIsProcessedAndReplayReturnsOriginalBalance`, `TestHTTPContractEndToEnd` | ✅ |
+| H9 | Conflitos de chave e de `(providerId, externalTransactionId)` | `IdempotencyConflictError` → 409 | `TestIdempotencyConflicts`, `TestHTTPContractEndToEnd` | ✅ |
+| H10 | Códigos HTTP distinguíveis documentados | ARCHITECTURE › Contrato HTTP | `TestProcessTransactionResponses`, `TestProcessTransactionErrors` | ✅ |
+| H11 | `POST /wallets/:id/reconciliation` | `Reconcile` + `httpapi.reconcile` | `TestReconciliation*`, `TestHTTPContractEndToEnd` | ✅ |
+| H12 | `/health/live` e `/health/ready` | API pública e admin (check de SQS na Fase 6) | `TestPublicHealthAndRoutingAndRecovery`, `TestApplicationStartsServesAndStopsCleanly` | 🚧 |
+| A1 | IdP OIDC externo (Keycloak) provisionado automaticamente | `deploy/keycloak/realm-wagering.json` (`--import-realm`) | `kctest` + `TestAuthenticationAgainstRealKeycloak` | ✅ |
+| A2 | `providerId` determinado pela identidade | Claim fixa `provider_id` → `app.ProviderActor` | `TestProviderIsolationOverHTTP`, `TestPrincipalActorMapping` | ✅ |
+| A3 | Isolamento entre provedores (consultas e replays) | Roles + `app.Actor` | `TestProviderIsolationOverHTTP`, `TestProviderIsolation` | ✅ |
+| A4 | Operações de carteira restritas ao serviço interno | Roles `wallets:*` + `RequireInternalService` | `TestProviderIsolationOverHTTP`, `TestOpenWalletConflictAndValidation` | ✅ |
 | A5 | Credenciais e políticas do broker | | | ⏳ |
 
 ## Mensageria (§10, §11)
@@ -105,7 +105,7 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 |---|---|---|---|---|
 | O1 | Logs JSON com identificadores de rastreio, sem dados sensíveis | `internal/platform/logging` | `logging_test.go` | ✅ |
 | O2 | Métricas: status, duplicatas, retries, DLQ, conflitos, atraso outbox, latência, divergências | `internal/platform/metrics` (DLQ/publicação instrumentados na Fase 6) | `metrics_test.go` | 🚧 |
-| O3 | Tracing OpenTelemetry (opcional) | `internal/platform/tracing`, `otelpgx` (HTTP/SQS nas Fases 5/6) | `tracing_test.go` | 🚧 |
+| O3 | Tracing OpenTelemetry (opcional) | `internal/platform/tracing`, `otelpgx`, `otelhttp` (SQS na Fase 6) | `tracing_test.go` | 🚧 |
 | O4 | Dashboard Grafana (opcional) | | | ⏳ |
 
 ## Verificação (§13)
@@ -116,8 +116,8 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | T2 | Integração: migrations, constraints, imutabilidade, atomicidade | `migrations_integration_test.go`, `schema_integration_test.go`, `txmanager_integration_test.go` | ✅ |
 | T3 | Integração: inbox, reentrega, outbox concorrente, retry, DLQ, reinício | Repositório: `TestInboxConcurrentDeliveriesInsertOnce`, `TestClaimDuePendingIsExclusiveAcrossWorkers`; SQS na Fase 6 | 🚧 |
 | T4 | Composição Fx: start/stop e liberação de recursos | `TestApplicationStartsServesAndStopsCleanly` (goleak), `TestApplicationFailsToStartWithoutDatabase` | ✅ |
-| T5 | Auth: credenciais ausentes/inválidas/expiradas; isolamento; sem efeitos | | ⏳ |
-| T6 | Mesma aposta 50× em paralelo → um débito | `TestSameBetFiftyTimesInParallelDebitsOnce` (HTTP/multi-processo na Fase 7) | 🚧 |
+| T5 | Auth: credenciais ausentes/inválidas/expiradas; isolamento; sem efeitos | `TestAuthenticationAgainstRealKeycloak`, `TestProviderIsolationOverHTTP` (Keycloak real), `auth_test.go` | ✅ |
+| T6 | Mesma aposta 50× em paralelo → um débito | `TestSameBetFiftyTimesInParallelDebitsOnce`, `TestConcurrentHTTPRequests` (multi-processo na Fase 7) | 🚧 |
 | T7 | Duas apostas de 80.00 sobre 100.00 | `TestTwoConcurrentBetsOfEightyOnHundred`, `TestConcurrentBetsOnSameWalletAtRepositoryLevel` (multi-processo na Fase 7) | 🚧 |
 | T8 | Carteiras distintas em paralelo | `TestDistinctWalletsAreProcessedInParallel`, `TestSameWalletSerializesAndDistinctWalletsProceedInParallel` | 🚧 |
 | T9 | Três instâncias independentes | | ⏳ |
