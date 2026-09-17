@@ -31,6 +31,7 @@ type Config struct {
 	Retry    Retry
 	Pending  Pending
 	Tracing  Tracing
+	Auth     Auth
 }
 
 type App struct {
@@ -81,6 +82,12 @@ type Pending struct {
 	BatchSize    int           `env:"PENDING_BATCH_SIZE" envDefault:"50"`
 	ErrorBackoff time.Duration `env:"PENDING_ERROR_BACKOFF" envDefault:"30s"`
 	Iteration    time.Duration `env:"PENDING_ITERATION_TIMEOUT" envDefault:"20s"`
+}
+
+type Auth struct {
+	Issuer   string `env:"AUTH_ISSUER"`
+	JWKSURL  string `env:"AUTH_JWKS_URL"`
+	Audience string `env:"AUTH_AUDIENCE" envDefault:"wallet-api"`
 }
 
 type Tracing struct {
@@ -153,6 +160,12 @@ func (c Config) Validate() error {
 	check(c.Pending.Iteration > 0 && c.Pending.Iteration < c.Pending.ClaimLease, "PENDING_ITERATION_TIMEOUT must be positive and shorter than PENDING_CLAIM_LEASE")
 	check(c.Pending.Iteration < c.App.ShutdownTimeout, "PENDING_ITERATION_TIMEOUT must be shorter than APP_SHUTDOWN_TIMEOUT")
 
+	if c.App.HasRole(RoleAPI) {
+		check(isHTTPURL(c.Auth.Issuer), "AUTH_ISSUER must be an http(s) URL when the api role is enabled")
+		check(isHTTPURL(c.Auth.JWKSURL), "AUTH_JWKS_URL must be an http(s) URL when the api role is enabled")
+		check(c.Auth.Audience != "", "AUTH_AUDIENCE is required when the api role is enabled")
+	}
+
 	if c.Tracing.Enabled {
 		check(c.Tracing.Endpoint != "", "OTEL_EXPORTER_OTLP_ENDPOINT is required when tracing is enabled")
 		check(c.Tracing.SamplePercent >= 0 && c.Tracing.SamplePercent <= 100, "OTEL_TRACES_SAMPLE_PERCENT must be within [0, 100]")
@@ -162,6 +175,10 @@ func (c Config) Validate() error {
 		return fmt.Errorf("config: invalid configuration: %w", errors.Join(errs...))
 	}
 	return nil
+}
+
+func isHTTPURL(s string) bool {
+	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }
 
 func (a App) HasRole(r Role) bool { return slices.Contains(a.Roles, r) }
