@@ -5,6 +5,7 @@ package fxapp_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -13,9 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/fx"
 	"go.uber.org/goleak"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/danfigueroa/backend-challenge-go/internal/app"
 	"github.com/danfigueroa/backend-challenge-go/internal/app/wageringapp"
@@ -24,13 +27,41 @@ import (
 	"github.com/danfigueroa/backend-challenge-go/internal/fxapp"
 	"github.com/danfigueroa/backend-challenge-go/internal/platform/config"
 	"github.com/danfigueroa/backend-challenge-go/internal/platform/health"
+	"github.com/danfigueroa/backend-challenge-go/internal/testsupport/lstest"
 	"github.com/danfigueroa/backend-challenge-go/internal/testsupport/pgtest"
 )
 
-var pg *pgtest.Instance
+var (
+	pg *pgtest.Instance
+	ls *lstest.Instance
+)
 
 func TestMain(m *testing.M) {
-	os.Exit(pgtest.RunMain(m, &pg))
+	os.Exit(runMain(m))
+}
+
+func runMain(m *testing.M) int {
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+	var g errgroup.Group
+	g.Go(func() (err error) { pg, err = pgtest.Start(ctx); return err })
+	g.Go(func() (err error) { ls, err = lstest.Start(ctx); return err })
+	err := g.Wait()
+	defer func() {
+		stop, cancelStop := context.WithTimeout(context.Background(), time.Minute)
+		defer cancelStop()
+		if pg != nil {
+			_ = pg.Terminate(stop)
+		}
+		if ls != nil {
+			_ = ls.Terminate(stop)
+		}
+	}()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	return m.Run()
 }
 
 func integrationConfig(t *testing.T, databaseURL string) config.Config {
@@ -44,6 +75,7 @@ func integrationConfig(t *testing.T, databaseURL string) config.Config {
 	t.Setenv("APP_SHUTDOWN_TIMEOUT", "10s")
 	t.Setenv("AUTH_ISSUER", "http://keycloak.test/realms/wagering")
 	t.Setenv("AUTH_JWKS_URL", "http://127.0.0.1:1/certs")
+	t.Setenv("APP_ROLES", "api,pendingref")
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatal(err)
@@ -206,4 +238,99 @@ func TestApplicationFailsToStartWithoutDatabase(t *testing.T) {
 		_ = application.Stop(context.Background())
 		t.Fatal("application started without a reachable database")
 	}
+}
+
+func TestAllRolesProcessSQSMessagesAndPublishEvents(t *testing.T) {
+	db := pg.NewDatabase(t)
+	integrationConfig(t, db.AppDSN)
+	t.Setenv("APP_ROLES", "api,consumer,outbox,pendingref")
+	t.Setenv("AWS_ENDPOINT_URL", ls.Endpoint)
+	t.Setenv("SQS_CONSUMER_ACCESS_KEY_ID", "wager-transactions-consumer")
+	t.Setenv("SQS_CONSUMER_SECRET_ACCESS_KEY", "local-consumer-secret")
+	t.Setenv("SNS_PUBLISHER_ACCESS_KEY_ID", "wallet-events-publisher")
+	t.Setenv("SNS_PUBLISHER_SECRET_ACCESS_KEY", "local-publisher-secret")
+	t.Setenv("SQS_INPUT_QUEUE_URL", ls.QueueURL("wager-transactions.fifo"))
+	t.Setenv("SQS_DLQ_URL", ls.QueueURL("wager-transactions-dlq.fifo"))
+	t.Setenv("SNS_EVENTS_TOPIC_ARN", "arn:aws:sns:us-east-1:000000000000:wallet-events.fifo")
+	t.Setenv("SQS_WAIT_TIME", "1s")
+	t.Setenv("OUTBOX_POLL_INTERVAL", "100ms")
+	t.Setenv("SQS_PROCESSING_TIMEOUT", "5s")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leaks := goleak.IgnoreCurrent()
+	var (
+		admin   *fxapp.AdminServer
+		wallets *walletapp.Service
+	)
+	application := fx.New(
+		fxapp.Options(cfg, fx.Decorate(quietLogger)),
+		fx.Populate(&admin, &wallets),
+		fx.NopLogger,
+	)
+	startCtx, cancelStart := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancelStart()
+	if err := application.Start(startCtx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	transport := &http.Transport{DisableKeepAlives: true}
+	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
+	var ready health.Report
+	if code := getJSON(t, client, "http://"+admin.Addr()+"/health/ready", &ready); code != http.StatusOK ||
+		ready.Checks["sqs"].Status != health.StatusUp || ready.Checks["sns"].Status != health.StatusUp || ready.Checks["postgres"].Status != health.StatusUp {
+		t.Errorf("ready = %d %+v", code, ready)
+	}
+
+	ctx := context.Background()
+	w, err := wallets.OpenWallet(ctx, walletapp.OpenWalletCommand{Actor: app.ServiceActor("fx"), PlayerID: "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1", Amount: "1000.00", Currency: "BRL"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := fmt.Sprintf(`{"messageId":"msg-e2e","type":"WagerTransactionRequested","occurredAt":"2026-09-08T12:00:00.000Z","data":{"providerId":"provider-a","externalTransactionId":"transaction-e2e","idempotencyKey":"provider-a:transaction-e2e","playerId":%q,"walletId":%q,"roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}}`,
+		w.PlayerID.String(), w.ID.String())
+	ls.Send(t, ls.QueueURL("wager-transactions.fifo"), w.ID.String(), "msg-e2e", body, nil)
+
+	messages := ls.Drain(t, ls.QueueURL("wallet-events-audit.fifo"), 4, 30*time.Second)
+	types := map[string]int{}
+	for _, m := range messages {
+		var e struct {
+			EventType string `json:"eventType"`
+		}
+		if err := json.Unmarshal([]byte(aws.ToString(m.Body)), &e); err != nil {
+			t.Fatal(err)
+		}
+		types[e.EventType]++
+	}
+	if types["WagerTransactionProcessed"] != 2 || types["WalletBalanceChanged"] != 2 {
+		t.Errorf("events delivered to subscribers = %v, want opening and bet events", types)
+	}
+	view, err := wallets.GetWallet(ctx, app.ServiceActor("fx"), w.ID)
+	if err != nil || view.Balance.Amount() != "975.00" {
+		t.Errorf("wallet after SQS message = %+v, %v", view, err)
+	}
+
+	var metricsBody string
+	getJSON(t, client, "http://"+admin.Addr()+"/metrics", &metricsBody)
+	for _, series := range []string{
+		`wallet_sqs_messages_total{queue="wager-transactions-consumer",result="PROCESSED"} 1`,
+		`wallet_outbox_publish_attempts_total{event_type="WalletBalanceChanged",result="published"} 2`,
+		`wallet_outbox_pending_events 0`,
+	} {
+		if !strings.Contains(metricsBody, series) {
+			t.Errorf("metrics missing %q", series)
+		}
+	}
+	transport.CloseIdleConnections()
+
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelStop()
+	if err := application.Stop(stopCtx); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	transport.CloseIdleConnections()
+	ls.CloseIdleConnections()
+	goleak.VerifyNone(t, leaks)
 }
