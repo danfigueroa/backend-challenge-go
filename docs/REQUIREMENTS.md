@@ -1,8 +1,15 @@
 # Matriz de rastreabilidade de requisitos
 
-Cada requisito de [`CHALLENGE.md`](CHALLENGE.md) mapeado para implementação e evidência de teste. Atualizada a cada entrega.
+Cada requisito de [`CHALLENGE.md`](CHALLENGE.md) mapeado para implementação e evidência verificável (teste, comando ou artefato). Os nomes de teste citados existem no repositório; `Test*` indica um grupo de testes com o mesmo prefixo.
 
-Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
+Legenda: ✅ atendido e verificado · ◐ atendido com limitação documentada
+
+| Suíte | Comando | Infraestrutura |
+|---|---|---|
+| Unitários | `go test -race ./...` | nenhuma |
+| Integração | `go test -race -tags=integration ./...` | Docker (testcontainers) |
+| Multi-instância e falhas | `go test -race -tags=e2e ./test/e2e/...` | `docker compose up -d --wait postgres keycloak localstack` |
+| Carga | `make load` | stack completa |
 
 ## Eliminatórios
 
@@ -10,27 +17,38 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 |---|---|---|---|---|
 | E1 | Autenticação efetiva nos endpoints de negócio | `internal/adapter/auth`, `httpapi.authenticate` | `TestAuthenticationAgainstRealKeycloak`, `TestProcessTransactionErrors` | ✅ |
 | E2 | Sem acesso não autorizado a operações/transações | Roles na borda + `app.Actor` nos casos de uso | `TestProviderIsolationOverHTTP`, `TestProviderIsolation`, `TestActorAuthorization` | ✅ |
-| E3 | Sem cálculo monetário em ponto flutuante | `internal/domain/money`; `forbidigo` | `make lint`, `FuzzParse` | 🚧 |
-| E4 | Sem saldo negativo por concorrência | Lock por carteira + `CHECK` | `TestTwoConcurrentBetsOfEightyOnHundred`, `TestCompetingBetsAcrossInstancesNeverOverdraw` (3 processos) | ✅ |
-| E5 | Sem movimentação duplicada | Idempotência + inbox + unicidades | `TestSameBetFiftyTimesInParallelDebitsOnce`, `TestIdenticalBetAcrossInstancesDebitsOnce`, `TestSameOperationThroughHTTPAndSQSIsAppliedOnce` | ✅ |
+| E3 | Sem cálculo monetário em ponto flutuante | `internal/domain/money` (`int64`); `forbidigo` bloqueia `float32`/`float64` | `make lint`, `FuzzParse`; `float` só aparece em métricas e na taxa de amostragem de tracing | ✅ |
+| E4 | Sem saldo negativo por concorrência | Lock por carteira + versão + `CHECK (balance_minor >= 0)` | `TestTwoConcurrentBetsOfEightyOnHundred`, `TestCompetingBetsAcrossInstancesNeverOverdraw` (3 processos), `TestKillDuringConcurrentLoadWithClientRetries` | ✅ |
+| E5 | Sem movimentação duplicada | Idempotência + inbox + `UNIQUE (wallet_id, transaction_id)` | `TestSameBetFiftyTimesInParallelDebitsOnce`, `TestIdenticalBetAcrossInstancesDebitsOnce`, `TestSameOperationThroughHTTPAndSQSIsAppliedOnce`, `TestConsumerCrashAfterCommitBeforeDeleteIsRedeliveredWithoutDoubleDebit` | ✅ |
 | E6 | Idempotência persistente (não em memória) | `wager_transactions` (chave, hash, resultado) | `TestReplayAfterRestartUsesPersistedState` | ✅ |
 | E7 | Funciona com múltiplas instâncias | Estado apenas no PostgreSQL; claims com `SKIP LOCKED` + lease; compose com 3 instâncias | `test/e2e` (processos independentes), `TestComposeInstancesShareState` | ✅ |
 | E8 | Sem publicação anterior ao commit | Outbox na mesma transação; publisher lê apenas linhas confirmadas | `TestEventsSurviveCrashBetweenCommitAndPublication`, `TestAllRolesProcessSQSMessagesAndPublishEvents` | ✅ |
-| E9 | Ledger auditável | `ledger_entries` append-only, encadeado, versionado | `TestLedgerConstraints`, `TestLedgerRepository` | 🚧 |
+| E9 | Ledger auditável | `ledger_entries` append-only (grants + triggers), encadeado e versionado; reconciliação | `TestLedgerConstraints`, `TestLedgerRepository`, `TestReconciliationDetectsDivergenceWithoutChangingBalance` | ✅ |
 | E10 | PostgreSQL, SQS e IdP reais nos testes | testcontainers: PostgreSQL 18, Keycloak 26.7.4, LocalStack 4.14.0 | `*_integration_test.go` | ✅ |
 
 ## Garantias obrigatórias (§5)
 
 | # | Garantia | Implementação | Evidência | Status |
 |---|---|---|---|---|
-| G1 | Dinheiro sem `float32`/`float64` | `int64` em `money`; `forbidigo` no `.golangci.yml` | `make lint` | 🚧 |
-| G2 | Idempotência persistente e resistente a reinício | Chave + hash + resultado persistidos | `TestReplayAfterRestartUsesPersistedState`, `TestPendingSurvivesRestartAndIsResumedByAnotherInstance` | ✅ |
+| G1 | Dinheiro sem `float32`/`float64` | `int64` em `money`, `BIGINT` no banco, strings no JSON; `forbidigo` no `.golangci.yml` | `make lint`, `FuzzParse` | ✅ |
+| G2 | Idempotência persistente e resistente a reinício | Chave + hash + resultado persistidos | `TestReplayAfterRestartUsesPersistedState`, `TestPendingSurvivesRestartAndIsResumedByAnotherInstance`, `TestGracefulShutdownCompletesAndRestartPreservesIdempotency` | ✅ |
 | G3 | Invariantes financeiras garantidas no banco | Migrations `000002`–`000004` e `000007` (constraints, triggers, constraint triggers adiados com buscas indexadas) | `TestWalletConstraints`, `TestLedgerConstraints`, `TestTransactionConstraints`, `TestIntegrityTriggersReadLedgerByIndexedLookups` | ✅ |
-| G4 | Publicação só após commit | Transactional outbox + publisher separado | `outboxpub` integration tests | ✅ |
+| G4 | Publicação só após commit | Transactional outbox + publisher separado que só lê linhas confirmadas | `TestEventsSurviveCrashBetweenCommitAndPublication`, `TestBrokerOutageDelaysMessagingWithoutLosingEvents` | ✅ |
 | G5 | Ledger append-only | Grants sem `UPDATE`/`DELETE` + triggers `ledger_entries_append_only` | `TestLedgerConstraints/append_only_*` | ✅ |
-| G6 | Carteiras independentes em paralelo; sem lock global | Lock de linha por carteira | `TestSameWalletSerializesAndDistinctWalletsProceedInParallel` | 🚧 |
-| G7 | Sem lost updates | `FOR UPDATE` + `WHERE version = $old` + trigger de versão + verificação adiada | `TestWalletRepository/stale_version…`, `TestConcurrentBetsOnSameWalletAtRepositoryLevel` | 🚧 |
+| G6 | Carteiras independentes em paralelo; sem lock global | Lock de linha por carteira | `TestSameWalletSerializesAndDistinctWalletsProceedInParallel`, `TestDistinctWalletsAreProcessedInParallel`, `TestManyWalletsUnderConcurrentLoadStayConsistent` | ✅ |
+| G7 | Sem lost updates | `FOR UPDATE` + `WHERE version = $old` + trigger de versão + verificação adiada | `TestWalletRepository/stale_version_is_a_concurrent_update`, `TestConcurrentBetsOnSameWalletAtRepositoryLevel` | ✅ |
 | G8 | Unicidade, não negatividade e imutabilidade no schema | Ver ARCHITECTURE › Invariantes impostas pelo banco | `schema_integration_test.go` | ✅ |
+
+## Ambiente de execução e falhas (§3)
+
+| # | Situação | Tratamento | Evidência | Status |
+|---|---|---|---|---|
+| F1 | Mesma operação recebida repetidamente, inclusive por HTTP e SQS | Chave + hash, inbox, double-check sob lock | `TestConcurrentHTTPAndSQSForTheSameOperation`, `TestSameOperationThroughHTTPAndSQSIsAppliedOnce`, `TestSQSDeliveriesAreDeduplicatedByInboxAndIdempotency` | ✅ |
+| F2 | Reversão antes da referência | `PENDING_REFERENCE` + worker com backoff e TTL; despertar quando a referência termina | `TestReversalArrivingBeforeReferenceIsResolvedLater`, `TestReversalWaitingOnRejectedReferenceIsWokenAndRejected`, `TestPendingReferenceExpiresWhenReferenceNeverArrives` | ✅ |
+| F3 | Operações simultâneas da mesma carteira | Lock de linha + versão + constraints | `TestTwoConcurrentBetsOfEightyOnHundred`, `TestIdenticalBetAcrossInstancesDebitsOnce` | ✅ |
+| F4 | Encerramento abrupto antes ou depois do commit | Commit único; delete/confirmação só após commit; lease | `TestKillDuringConcurrentLoadWithClientRetries`, `TestConsumerCrashAfterCommitBeforeDeleteIsRedeliveredWithoutDoubleDebit`, `TestPublisherCrashBetweenPublishAndConfirmRepublishesSameEventID` | ✅ |
+| F5 | Publicação repetida de um evento | `MessageDeduplicationId = eventId` estável | `TestRecoveryBetweenPublicationAndConfirmationKeepsEventID`, `TestPublisherCrashBetweenPublishAndConfirmRepublishesSameEventID` | ✅ |
+| F6 | Indisponibilidade temporária do PostgreSQL ou do SQS | Retry classificado, 503 + `Retry-After`, backoff de visibilidade, readiness, outbox retida | `TestDatabaseOutageIsReportedAndRecoveredWithoutDuplicates`, `TestBrokerOutageDelaysMessagingWithoutLosingEvents`, `TestTxManagerLockTimeoutIsTransient`, `TestTransientFailuresAreRetriedThenRedriven` | ✅ |
 
 ## Stack e composição (§4)
 
@@ -82,7 +100,7 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 | A2 | `providerId` determinado pela identidade | Claim fixa `provider_id` → `app.ProviderActor` | `TestProviderIsolationOverHTTP`, `TestPrincipalActorMapping` | ✅ |
 | A3 | Isolamento entre provedores (consultas e replays) | Roles + `app.Actor` | `TestProviderIsolationOverHTTP`, `TestProviderIsolation` | ✅ |
 | A4 | Operações de carteira restritas ao serviço interno | Roles `wallets:*` + `RequireInternalService` | `TestProviderIsolationOverHTTP`, `TestOpenWalletConflictAndValidation` | ✅ |
-| A5 | Credenciais e políticas do broker | Credenciais por componente, IAM + políticas de recurso provisionadas (não aplicadas pelo LocalStack community) | `TestProvisionedMessagingTopology` | ✅ |
+| A5 | Credenciais e políticas do broker | Credenciais por componente, IAM + políticas de recurso provisionadas; LocalStack community registra mas não aplica IAM (ver ARCHITECTURE › Credenciais e políticas do broker) | `TestProvisionedMessagingTopology` | ◐ |
 
 ## Mensageria (§10, §11)
 
@@ -133,9 +151,11 @@ Legenda: ✅ concluído · 🚧 em andamento · ⏳ pendente
 
 | # | Item | Status |
 |---|---|---|
-| X1 | `README.md` completo | ⏳ |
-| X2 | `ARCHITECTURE.md` com todas as decisões e limitações | ⏳ |
-| X3 | `.env.example` | 🚧 |
-| X4 | `docker compose up --build`, `go test ./...`, `go test -race ./...`, `go vet ./...` | 🚧 |
-| X5 | Instruções de integração, multi-instância e falhas | ✅ |
-| X6 | Código formatado com `gofmt` | ✅ |
+| X1 | `README.md`: pré-requisitos, variáveis, filas, migrations, execução, exemplos de chamadas e testes | ✅ |
+| X2 | `ARCHITECTURE.md` com dinheiro, transações, idempotência, locks, pendências, reversões, inbox/outbox, auth, Fx, shutdown, limitações e trabalho não concluído | ✅ |
+| X3 | `.env.example` com valores locais, sem segredos reais | ✅ |
+| X4 | `docker compose up --build`, `go test ./...`, `go test -race ./...`, `go vet ./...` | ✅ |
+| X5 | Instruções separadas para dependências de teste, integração, multi-instância e falhas, com build tags | ✅ |
+| X6 | Código formatado com `gofmt`, dependências reproduzíveis (`go.sum`, `go mod verify`) | ✅ |
+| X7 | Provisionamento automático do IdP, identidades de teste e fluxos autenticados documentados | ✅ |
+| X8 | Teste de carga com comando, ambiente, metodologia, throughput, p50/p95/p99, erros, conflitos e atraso da outbox | ✅ |
