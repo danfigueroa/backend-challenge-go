@@ -41,7 +41,7 @@ vet: ## Run go vet (all build tags)
 .PHONY: lint
 lint: vet ## Run gofmt check, go vet and golangci-lint
 	@test -z "$$(gofmt -s -l . | tee /dev/stderr)" || (echo "gofmt found unformatted files" && exit 1)
-	$(GOLANGCI_LINT) run ./...
+	$(GOLANGCI_LINT) run --build-tags=integration,e2e,faultinject ./...
 
 ## ---------- Tests ----------
 
@@ -59,8 +59,8 @@ test-integration: ## Integration tests against real containers (testcontainers-g
 	go test -race -count=1 -tags=integration -timeout=20m ./...
 
 .PHONY: test-e2e
-test-e2e: ## Multi-instance and fault-injection tests (requires `make up-e2e`)
-	go test -count=1 -tags=e2e -timeout=30m ./test/e2e/...
+test-e2e: ## Multi-process and fault-injection tests (requires `make up-infra`; `make up` also enables the compose smoke test)
+	go test -race -count=1 -tags=e2e -timeout=30m -v ./test/e2e/...
 
 .PHONY: fuzz
 fuzz: ## Fuzz money parsing for 30s
@@ -69,12 +69,12 @@ fuzz: ## Fuzz money parsing for 30s
 ## ---------- Environment ----------
 
 .PHONY: up
-up: ## Start the full stack
-	$(COMPOSE) up --build -d
+up: ## Start the full stack (3 instances + observability) and wait until healthy
+	$(COMPOSE) up --build -d --wait
 
-.PHONY: up-e2e
-up-e2e: ## Start the stack with fault-injection binaries for e2e tests
-	$(COMPOSE) -f docker-compose.yml -f docker-compose.e2e.yml up --build -d
+.PHONY: up-infra
+up-infra: ## Start only PostgreSQL, Keycloak and LocalStack (used by e2e tests)
+	$(COMPOSE) up -d --wait postgres keycloak localstack
 
 .PHONY: down
 down: ## Stop the stack and remove volumes
@@ -88,15 +88,15 @@ logs: ## Tail application logs
 
 .PHONY: migrate-up
 migrate-up: ## Apply all pending migrations
-	$(MIGRATE) up
+	$(MIGRATE) migrate up
 
 .PHONY: migrate-down
 migrate-down: ## Revert the last migration (N=1 by default)
-	$(MIGRATE) down $(or $(N),1)
+	$(MIGRATE) migrate down $(or $(N),1)
 
 .PHONY: migrate-version
 migrate-version: ## Show current migration version
-	$(MIGRATE) version
+	$(MIGRATE) migrate version
 
 ## ---------- Load ----------
 
