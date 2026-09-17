@@ -168,15 +168,16 @@ func mustToken(t *testing.T, client string) string {
 }
 
 type Env struct {
-	t        *testing.T
-	name     string
-	ownerDSN string
-	appDSN   string
-	db       *pgxpool.Pool
-	queueURL string
-	dlqURL   string
-	topicARN string
-	auditURL string
+	t           *testing.T
+	name        string
+	ownerDSN    string
+	appDSN      string
+	awsEndpoint string
+	db          *pgxpool.Pool
+	queueURL    string
+	dlqURL      string
+	topicARN    string
+	auditURL    string
 }
 
 func newEnv(t *testing.T) *Env {
@@ -192,6 +193,8 @@ func newEnv(t *testing.T) *Env {
 		name:     name,
 		ownerDSN: fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", ownerUser, ownerPassword, postgresHost, name),
 		appDSN:   fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", appUser, appPassword, postgresHost, name),
+
+		awsEndpoint: localstackURL,
 	}
 	t.Cleanup(func() {
 		if e.db != nil {
@@ -295,7 +298,7 @@ func (e *Env) launch(name, roles string, extra map[string]string) *Instance {
 		"HTTP_ADDR": "127.0.0.1:" + apiPort, "ADMIN_ADDR": "127.0.0.1:" + adminPort, "APP_SHUTDOWN_TIMEOUT": "15s",
 		"DATABASE_URL": e.appDSN, "DATABASE_MAX_CONNS": "10", "DATABASE_MIN_CONNS": "0",
 		"AUTH_ISSUER": "http://localhost:8081/realms/wagering", "AUTH_JWKS_URL": keycloakURL + "/realms/wagering/protocol/openid-connect/certs",
-		"AWS_REGION": region, "AWS_ENDPOINT_URL": localstackURL,
+		"AWS_REGION": region, "AWS_ENDPOINT_URL": e.awsEndpoint,
 		"SQS_CONSUMER_ACCESS_KEY_ID": "wager-transactions-consumer", "SQS_CONSUMER_SECRET_ACCESS_KEY": "local-consumer-secret",
 		"SNS_PUBLISHER_ACCESS_KEY_ID": "wallet-events-publisher", "SNS_PUBLISHER_SECRET_ACCESS_KEY": "local-publisher-secret",
 		"SQS_INPUT_QUEUE_URL": e.queueURL, "SQS_DLQ_URL": e.dlqURL, "SNS_EVENTS_TOPIC_ARN": e.topicARN,
@@ -396,6 +399,7 @@ func (i *Instance) waitExit(t *testing.T, timeout time.Duration) int {
 
 type reply struct {
 	status int
+	header http.Header
 	body   map[string]any
 	raw    string
 }
@@ -421,7 +425,7 @@ func call(t *testing.T, method, url, bearer, body string, headers ...string) rep
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
-	r := reply{status: resp.StatusCode, raw: string(raw)}
+	r := reply{status: resp.StatusCode, header: resp.Header, raw: string(raw)}
 	_ = json.Unmarshal(raw, &r.body)
 	return r
 }
@@ -585,4 +589,43 @@ func (e *Env) assertFinancialConsistency(t *testing.T) {
 		t.Errorf("%d transactions moved money more than once", n)
 	}
 	t.Logf("financial consistency verified for %d wallets", checked)
+}
+
+func (e *Env) proxyDatabase(t *testing.T) *faultProxy {
+	t.Helper()
+	p := newFaultProxy(t, postgresHost)
+	e.appDSN = fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", appUser, appPassword, p.addr(), e.name)
+	return p
+}
+
+func (e *Env) proxyBroker(t *testing.T) *faultProxy {
+	t.Helper()
+	endpoint, err := url.Parse(localstackURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newFaultProxy(t, endpoint.Host)
+	e.awsEndpoint = "http://" + p.addr()
+	return p
+}
+
+func (i *Instance) ready(t *testing.T) int {
+	t.Helper()
+	return call(t, http.MethodGet, i.adminURL+"/health/ready", "", "").status
+}
+
+func (i *Instance) metric(t *testing.T, prefix string) float64 {
+	t.Helper()
+	r := call(t, http.MethodGet, i.adminURL+"/metrics", "", "")
+	total := 0.0
+	for _, line := range strings.Split(r.raw, "\n") {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		fields := strings.Fields(line)
+		if v, err := strconv.ParseFloat(fields[len(fields)-1], 64); err == nil {
+			total += v
+		}
+	}
+	return total
 }
