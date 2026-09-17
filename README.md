@@ -34,6 +34,8 @@ make lint               # gofmt, go vet e golangci-lint
 make up                 # stack completa via Docker Compose (3 instâncias)
 make up-infra           # apenas PostgreSQL, Keycloak e LocalStack
 make down               # derruba a stack e remove volumes
+make load               # teste de carga k6 (perfil base)
+make load-stress        # teste de carga k6 (perfil de estresse)
 ```
 
 ## Testes
@@ -108,7 +110,8 @@ Valores de exemplo em [`.env.example`](.env.example). A configuração é valida
 | `SQS_PROCESSING_TIMEOUT` | `10s` | Prazo por mensagem (menor que a visibilidade da fila) |
 | `SQS_RETRY_BASE_DELAY` / `SQS_RETRY_MAX_DELAY` | `2s` / `60s` | Backoff de visibilidade para falhas transitórias |
 | `SNS_EVENTS_TOPIC_ARN` | — (obrigatório com papel `outbox`) | Destino dos eventos |
-| `OUTBOX_POLL_INTERVAL` / `OUTBOX_BATCH_SIZE` / `OUTBOX_LEASE` | `500ms` / `50` / `30s` | Publisher da outbox |
+| `OUTBOX_POLL_INTERVAL` / `OUTBOX_BATCH_SIZE` / `OUTBOX_LEASE` | `500ms` / `100` / `30s` | Publisher da outbox |
+| `OUTBOX_PUBLISH_CONCURRENCY` | `8` | Carteiras publicadas em paralelo por lote (ordem preservada dentro de cada carteira) |
 | `OUTBOX_RETRY_BASE_DELAY` / `OUTBOX_RETRY_MAX_DELAY` | `1s` / `5m` | Backoff de publicação |
 
 ## Autenticação
@@ -245,3 +248,34 @@ A injeção de falhas só existe em binários compilados com `-tags faultinject`
 | `outbox-after-publish-before-confirm` | evento aceito pelo SNS, `published_at` ainda não gravado |
 
 Variáveis opcionais da suíte: `E2E_POSTGRES_HOST`, `E2E_POSTGRES_OWNER`, `E2E_POSTGRES_OWNER_PASSWORD`, `E2E_POSTGRES_APP_USER`, `E2E_POSTGRES_APP_PASSWORD`, `E2E_KEYCLOAK_URL`, `E2E_LOCALSTACK_URL`, `E2E_COMPOSE_API_URLS`.
+
+## Observabilidade local
+
+| Ferramenta | Endereço | Conteúdo |
+|---|---|---|
+| Grafana | `http://localhost:3000` | dashboard **Wallet Service** (pasta Wallet) provisionado automaticamente: HTTP, processamento, idempotência, concorrência, SQS/DLQ, outbox, pendências, reconciliação e runtime |
+| Prometheus | `http://localhost:9090` | métricas das três instâncias |
+| Jaeger | `http://localhost:16686` | traces de HTTP, SQL, SQS e SNS (`OTEL_TRACES_SAMPLE_PERCENT` controla a amostragem, padrão 100) |
+
+## Teste de carga
+
+```sh
+OTEL_TRACES_SAMPLE_PERCENT=10 docker compose up --build -d --wait
+make load
+```
+
+O k6 roda dentro do compose (perfil `load`), com três cenários (liquidações completas, duplicatas simultâneas nas três instâncias e carteiras concorridas) e thresholds de latência, respostas fora do contrato e divergências de reconciliação. Resultados, ambiente de medição e os gargalos encontrados e corrigidos estão em [docs/LOAD_TEST.md](docs/LOAD_TEST.md).
+
+Resumo do perfil base em um MacBook de 8 núcleos com toda a stack local: ~790 req/s, p95 de 57 ms em `BET`, 0 erros e 0 divergências em 87 mil lançamentos.
+
+## Integração contínua
+
+`.github/workflows/ci.yml` executa, a cada push na `main` e em pull requests:
+
+| Job | Comando |
+|---|---|
+| Lint | `go mod verify` e `make lint` (gofmt, go vet com todas as build tags, golangci-lint) |
+| Unit tests | `make test-cover` (`-race`, relatório de cobertura como artefato) |
+| Integration tests | `make test-integration` (PostgreSQL, Keycloak e LocalStack via testcontainers) |
+| Multi-instance and fault-injection tests | `make up` (stack completa com 3 instâncias) e `make test-e2e`; logs do compose em caso de falha |
+
