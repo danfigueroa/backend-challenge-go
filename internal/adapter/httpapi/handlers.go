@@ -120,9 +120,6 @@ func decodeJSON(r *http.Request, into any) error {
 	if err := dec.Decode(into); err != nil {
 		return malformed(err)
 	}
-	if dec.More() {
-		return malformed(errors.New("unexpected data after the JSON object"))
-	}
 	var extra json.RawMessage
 	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
 		return malformed(errors.New("unexpected data after the JSON object"))
