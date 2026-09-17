@@ -1,5 +1,7 @@
 # backend-challenge-go
 
+[![CI](https://github.com/danfigueroa/backend-challenge-go/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/danfigueroa/backend-challenge-go/actions/workflows/ci.yml)
+
 Serviço em Go para **processamento distribuído de operações de apostas** sobre carteiras de jogadores: API HTTP autenticada e consumidor SQS que compartilham o mesmo caso de uso, com integridade financeira imposta pelo banco, idempotência persistente, coordenação por carteira entre várias instâncias, transactional inbox/outbox e recuperação de falhas.
 
 | Documento | Conteúdo |
@@ -304,6 +306,10 @@ O k6 roda dentro do compose com três cenários (liquidações completas, duplic
 | Unit tests | `make test-cover` (`-race`, cobertura como artefato) |
 | Integration tests | `make test-integration` |
 | Multi-instance and fault-injection tests | `make up` e `make test-e2e`, com logs do compose em caso de falha |
+
+Os jobs rodam em runners `ubuntu-24.04` limpos, sem cache de imagens, então cada execução também valida o build a partir de um checkout novo, o `-race` com cgo no Linux e a subida completa do Docker Compose com as três instâncias. Execução no commit `86a594b`, com todos os jobs aprovados em 4m40s:
+
+![Execução do GitHub Actions com Lint, Unit tests, Integration tests e Multi-instance and fault-injection tests aprovados](docs/images/ci-github-actions.png)
 
 ## Estrutura
 
