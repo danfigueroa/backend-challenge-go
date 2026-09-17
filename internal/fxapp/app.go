@@ -27,6 +27,9 @@ func Options(cfg config.Config, extra ...fx.Option) fx.Option {
 		ApplicationModule,
 		AdminModule,
 	}
+	if cfg.App.HasRole(config.RoleAPI) {
+		options = append(options, APIModule)
+	}
 	if cfg.App.HasRole(config.RolePendingRef) {
 		options = append(options, PendingReferenceModule)
 	}
