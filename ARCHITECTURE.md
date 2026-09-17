@@ -884,6 +884,41 @@ OpenTelemetry com exportador OTLP/HTTP (`OTEL_TRACES_ENABLED=true`), propagaçã
 
 Os checks rodam em paralelo, com timeout individual (`DATABASE_HEALTH_TIMEOUT`) e cache de 1 s para que probes frequentes não sobrecarreguem o banco. Os endpoints são expostos na API pública (sem autenticação) e no servidor administrativo.
 
+## Ambiente local e multi-instância
+
+`docker-compose.yml` sobe a mesma topologia usada em produção em escala reduzida: PostgreSQL, um job `migrate` de execução única, Keycloak, LocalStack, **três instâncias da aplicação** (`app-1..3`), Jaeger, Prometheus e Grafana.
+
+- **Ordem de subida**: as instâncias dependem de `migrate` concluído com sucesso (`service_completed_successfully`) e de Keycloak/LocalStack saudáveis. Migrations nunca rodam dentro do processo da aplicação, evitando corrida entre instâncias.
+- **Credenciais separadas**: `migrate` usa o dono do schema (`wallet_owner`); as instâncias usam `wallet_service`, que só tem os privilégios de `wallet_app`.
+- **Emissor do token**: `AUTH_ISSUER` é `http://localhost:8081/realms/wagering` (o endereço que os clientes usam para obter tokens), enquanto `AUTH_JWKS_URL` aponta para `keycloak:8080` dentro da rede. Separar emissor e JWKS permite validar `iss` exatamente sem exigir que o container resolva `localhost` para o Keycloak.
+- **Healthchecks**: a imagem distroless executa `/wallet healthcheck`, que consulta `/health/ready` do servidor administrativo; o compose só considera a stack pronta quando PostgreSQL, SQS e SNS respondem em cada instância.
+- **Escala independente**: todas as instâncias do compose rodam todos os papéis, mas `APP_ROLES` permite separar API, consumidores, publisher e worker de pendências em deployments distintos.
+
+## Testes multi-processo e injeção de falhas
+
+### Por que processos e não goroutines
+
+Os testes de integração já exercitam concorrência com vários `Service` no mesmo processo. A suíte `test/e2e` vai além: compila o binário real e inicia **processos independentes**, com pools de conexão, consumidores SQS e publishers próprios. Assim `kill -9`, `SIGTERM`, reinício e reentrega de mensagens acontecem exatamente como em produção, sem estado compartilhado em memória que possa mascarar um defeito.
+
+### Isolamento
+
+Cada teste cria um banco novo (migrado pelo subcomando `wallet migrate up`), filas de entrada e DLQ com redrive, tópico SNS FIFO e fila de auditoria assinante. Portas são alocadas dinamicamente. A infraestrutura (PostgreSQL, Keycloak, LocalStack) é a do compose, então nada é simulado.
+
+### Pontos de falha
+
+`internal/platform/faultinject` tem duas implementações selecionadas por build tag. Sem `faultinject`, `CrashAt` é uma função vazia e o build de produção não contém nenhum caminho de falha. Com a tag, o módulo Fx fornece hooks opcionais (`sqsconsumer.Hooks.BeforeDelete` e `outboxpub.Hooks.AfterPublish`) que encerram o processo com `os.Exit(86)` quando o ponto está listado em `FAULT_CRASH_POINT`. `os.Exit` não executa hooks de shutdown, reproduzindo um crash real no ponto mais delicado de cada fluxo:
+
+| Ponto | Estado no crash | Recuperação esperada | Verificado |
+|---|---|---|---|
+| `sqs-after-commit-before-delete` | débito confirmado e inbox marcado; mensagem ainda na fila | visibilidade expira, outra instância recebe a mensagem, o inbox a reconhece como duplicata e ela é removida | saldo e número de débitos inalterados, fila vazia |
+| `outbox-after-publish-before-confirm` | evento aceito pelo SNS; `published_at` nulo e lease ativo | lease expira, dois publishers disputam o evento, um republica com o mesmo `eventId` | outbox confirmada; cada `eventId` chega uma única vez à fila de auditoria (deduplicação FIFO) |
+
+### Cenários
+
+Além dos pontos de falha, a suíte cobre concorrência entre instâncias (50 apostas idênticas, 80+80 sobre 100, 20 carteiras com apostas e ganhos), a mesma operação por HTTP e SQS ao mesmo tempo, reversão pendente que sobrevive a `kill -9`, expiração por TTL, `kill -9` durante carga com retries do cliente e reinício gracioso preservando idempotência. Requisições interrompidas pelo crash recebem erro de rede; o cliente repete com a mesma chave e recebe o resultado original ou o processamento único, nunca um segundo débito.
+
+Toda execução termina com a verificação de consistência financeira feita direto no banco: saldo igual à soma assinada do ledger, saldo não negativo, versão da carteira igual à da última entrada e nenhuma transação com mais de uma entrada.
+
 ## Limitações e interpretações
 
 - **Moedas**: apenas `BRL`, `USD` e `EUR`, todas com duas casas decimais. Moedas com outra escala (por exemplo, `JPY`) exigiriam escala por moeda.
