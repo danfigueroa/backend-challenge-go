@@ -31,13 +31,17 @@ make test               # testes unitários com -race
 make test-cover         # testes unitários com relatório de cobertura
 make fuzz               # fuzzing do parser de Money por 30s
 make lint               # gofmt, go vet e golangci-lint
+make up                 # stack completa via Docker Compose (3 instâncias)
+make up-infra           # apenas PostgreSQL, Keycloak e LocalStack
+make down               # derruba a stack e remove volumes
 ```
 
 ## Testes
 
 ```sh
 make test               # unitários (go test -race ./...)
-make test-integration   # unitários + integração com PostgreSQL real (testcontainers-go)
+make test-integration   # unitários + integração com PostgreSQL, Keycloak e LocalStack reais (testcontainers-go)
+make test-e2e           # processos independentes, kill -9 e injeção de falhas (requer make up-infra)
 ```
 
 Os testes de integração usam a build tag `integration` e precisam apenas do Docker em execução: o container `postgres:18.6-alpine3.24` é criado e removido automaticamente. Comando equivalente sem Make:
@@ -54,12 +58,12 @@ go test -race -count=1 -tags=integration ./...
 make build                                   # gera ./bin/wallet
 ./bin/wallet help
 
-export DATABASE_MIGRATIONS_URL=postgres://wallet_owner:...@localhost:5432/wallet
+export DATABASE_MIGRATIONS_URL=postgres://wallet_owner:...@localhost:55432/wallet
 ./bin/wallet migrate up                      # aplica as migrations
 ./bin/wallet migrate down 1                  # reverte a última migration
 ./bin/wallet migrate version                 # versão atual
 
-export DATABASE_URL=postgres://wallet_service:...@localhost:5432/wallet
+export DATABASE_URL=postgres://wallet_service:...@localhost:55432/wallet
 ./bin/wallet serve                           # sobe o serviço (SIGTERM encerra graciosamente)
 ```
 
@@ -181,4 +185,63 @@ aws --endpoint-url http://localhost:4566 sqs receive-message --max-number-of-mes
 
 Os testes do consumidor (`internal/adapter/sqsconsumer`), do publisher (`internal/worker/outboxpub`) e da composição com todos os papéis (`internal/fxapp`) sobem **LocalStack e PostgreSQL reais**.
 
-As seções de Docker Compose e testes multi-instância/falhas serão adicionadas à medida que cada componente for entregue.
+## Docker Compose
+
+```sh
+docker compose up --build -d --wait     # ou: make up
+```
+
+| Serviço | Endereço no host | Observação |
+|---|---|---|
+| `app-1`, `app-2`, `app-3` | API `:8091`, `:8092`, `:8093` · admin `:9091`, `:9092`, `:9093` | três instâncias independentes com todos os papéis (`api,consumer,outbox,pendingref`) |
+| `postgres` | `localhost:55432` (`POSTGRES_HOST_PORT`) | porta alternativa para não colidir com um PostgreSQL local |
+| `migrate` | — | executa `wallet migrate up` uma vez; as instâncias só sobem após sucesso |
+| `keycloak` | `http://localhost:8081` | realm `wagering` importado no boot |
+| `localstack` | `http://localhost:4566` | filas, tópico e identidades provisionados no boot |
+| `jaeger` | `http://localhost:16686` | traces de HTTP, SQL, SQS e SNS |
+| `prometheus` | `http://localhost:9090` | coleta `/metrics` das três instâncias |
+| `grafana` | `http://localhost:3000` | acesso anônimo de leitura, datasource Prometheus provisionado |
+
+Todas as instâncias compartilham o mesmo banco, fila e tópico: uma carteira aberta em `app-1` pode receber uma aposta em `app-2` e um replay em `app-3`. Migrations manuais via compose:
+
+```sh
+make migrate-version
+make migrate-down N=1
+make migrate-up
+```
+
+Para subir as instâncias com os pontos de falha compilados (ver abaixo): `BUILD_TAGS=faultinject docker compose up --build -d --wait`.
+
+## Testes multi-instância e de falhas
+
+A suíte `test/e2e` (build tag `e2e`) compila o binário com a tag `faultinject` e inicia **processos do sistema operacional independentes** contra o PostgreSQL, o Keycloak e o LocalStack do compose. Cada teste cria um banco próprio (migrado com `wallet migrate up`), filas, DLQ e tópico próprios, portanto os cenários são isolados e podem ser repetidos.
+
+```sh
+make up-infra
+make test-e2e
+```
+
+| Cenário | Teste |
+|---|---|
+| Mesma aposta 50× distribuída entre 3 instâncias → um débito, 49 replays com o mesmo saldo | `TestIdenticalBetAcrossInstancesDebitsOnce` |
+| Duas apostas de 80.00 sobre 100.00 em instâncias diferentes | `TestCompetingBetsAcrossInstancesNeverOverdraw` |
+| 20 carteiras × apostas e ganhos concorrentes em 3 instâncias + reconciliação | `TestManyWalletsUnderConcurrentLoadStayConsistent` |
+| Mesma operação via HTTP (10×) e SQS (5 mensagens) simultaneamente | `TestSameOperationThroughHTTPAndSQSIsAppliedOnce` |
+| Consumer morre após o commit e antes do delete; outra instância recebe a reentrega | `TestConsumerCrashAfterCommitBeforeDeleteIsRedeliveredWithoutDoubleDebit` |
+| Publisher morre entre publicar e confirmar; dois publishers retomam com o mesmo `eventId` | `TestPublisherCrashBetweenPublishAndConfirmRepublishesSameEventID` |
+| Reversão pendente sobrevive a `kill -9` e é resolvida por outra instância | `TestPendingReferenceSurvivesKillAndIsResolvedByAnotherInstance` |
+| Referência que nunca chega expira por TTL | `TestPendingReferenceExpiresWhenReferenceNeverArrives` |
+| `kill -9` de uma instância durante carga, com retries do cliente | `TestKillDuringConcurrentLoadWithClientRetries` |
+| `SIGTERM`, reinício e idempotência preservada (HTTP e SQS) | `TestGracefulShutdownCompletesAndRestartPreservesIdempotency` |
+| Estado compartilhado entre `app-1..3` do compose (ignorado se não estiverem rodando) | `TestComposeInstancesShareState` |
+
+Todos os cenários terminam verificando, direto no banco, que saldo = soma do ledger, que a versão da carteira bate com a última entrada e que nenhuma transação movimentou dinheiro duas vezes.
+
+A injeção de falhas só existe em binários compilados com `-tags faultinject`; no build padrão os pontos são funções vazias. O ponto é escolhido por `FAULT_CRASH_POINT` e o processo termina com `os.Exit(86)`, sem shutdown gracioso, como em um `kill -9`:
+
+| `FAULT_CRASH_POINT` | Momento |
+|---|---|
+| `sqs-after-commit-before-delete` | transação confirmada, mensagem ainda não removida da fila |
+| `outbox-after-publish-before-confirm` | evento aceito pelo SNS, `published_at` ainda não gravado |
+
+Variáveis opcionais da suíte: `E2E_POSTGRES_HOST`, `E2E_POSTGRES_OWNER`, `E2E_POSTGRES_OWNER_PASSWORD`, `E2E_POSTGRES_APP_USER`, `E2E_POSTGRES_APP_PASSWORD`, `E2E_KEYCLOAK_URL`, `E2E_LOCALSTACK_URL`, `E2E_COMPOSE_API_URLS`.
