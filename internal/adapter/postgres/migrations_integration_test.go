@@ -45,7 +45,7 @@ func TestMigrationsApplyRevertAndReapply(t *testing.T) {
 		t.Fatal(err)
 	}
 	status, err = migrator.Status()
-	if err != nil || status.Version != 6 || status.Dirty {
+	if err != nil || status.Version != 7 || status.Dirty {
 		t.Fatalf("status after up = %+v, %v", status, err)
 	}
 	assertTables(true)
@@ -58,11 +58,11 @@ func TestMigrationsApplyRevertAndReapply(t *testing.T) {
 		t.Fatal(err)
 	}
 	status, err = migrator.Status()
-	if err != nil || status.Version != 5 {
+	if err != nil || status.Version != 6 {
 		t.Fatalf("status after down 1 = %+v, %v", status, err)
 	}
 
-	if err := migrator.Down(5); err != nil {
+	if err := migrator.Down(6); err != nil {
 		t.Fatal(err)
 	}
 	status, err = migrator.Status()
