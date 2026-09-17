@@ -410,6 +410,7 @@ Os triggers levantam `SQLSTATE 23000` com `CONSTRAINT` nomeada, então a aplica�
 | `000004` | `ledger_entries` + cadeia + triggers adiados de consistência entre as três tabelas |
 | `000005` | `inbox_messages` |
 | `000006` | `outbox_events` |
+| `000007` | busca indexada no trigger `wager_transactions_check_ledger` (ver [Custo das verificações adiadas](#limitações-e-interpretações)) |
 
 Toda migration tem `down` correspondente. O teste `TestMigrationsApplyRevertAndReapply` aplica tudo, reverte um passo, reverte o restante e reaplica em um banco vazio.
 
@@ -629,9 +630,9 @@ Mensagens enviadas explicitamente à DLQ levam os atributos `dlqReason`, `dlqErr
 `internal/worker/outboxpub`, papel `outbox`.
 
 1. **Claim**: um único `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)` reserva até `OUTBOX_BATCH_SIZE` eventos vencidos, gravando `locked_by = APP_INSTANCE_ID`, `locked_until = now + OUTBOX_LEASE` e `attempts + 1`. Vários publishers disputam a tabela sem pegar o mesmo evento.
-2. **Publicação** no SNS FIFO, com payload igual ao snapshot gravado (byte a byte), `MessageGroupId = partitionKey` (carteira), `MessageDeduplicationId = eventId` e atributos `eventType`, `eventId`, `partitionKey`.
+2. **Publicação** no SNS FIFO, com payload igual ao snapshot gravado (byte a byte), `MessageGroupId = partitionKey` (carteira), `MessageDeduplicationId = eventId` e atributos `eventType`, `eventId`, `partitionKey`. O lote é agrupado por `partitionKey` preservando a ordem de commit; grupos diferentes são publicados em paralelo por até `OUTBOX_PUBLISH_CONCURRENCY` goroutines e os eventos de um mesmo grupo, em sequência.
 3. **Confirmação**: `published_at` é gravado só se o evento ainda pertence ao mesmo publisher.
-4. **Falha**: `next_attempt_at = now + min(1s × 2^(attempts−1), 5min)`, `last_error` preenchido e lock liberado.
+4. **Falha**: `next_attempt_at = now + min(1s × 2^(attempts−1), 5min)`, `last_error` preenchido e lock liberado. Os eventos seguintes da mesma carteira no lote **não são enviados**: recebem o mesmo `next_attempt_at` com `last_error = "waiting for preceding event ..."`, para que nenhum evento posterior chegue antes do que falhou. As demais carteiras do lote seguem normalmente.
 5. **Trabalho abandonado**: se o processo morre com eventos reservados, o lease expira e outra instância os assume.
 6. **Shutdown**: eventos reservados e ainda não publicados são liberados imediatamente (`next_attempt_at = now`).
 
@@ -643,8 +644,12 @@ Mensagens enviadas explicitamente à DLQ levam os atributos `dlqReason`, `dlqErr
 | Entre a publicação e a confirmação | Após o lease, outra instância republica **com o mesmo `eventId`**; o SNS FIFO descarta a duplicata e o assinante recebe uma única vez | `TestRecoveryBetweenPublicationAndConfirmationKeepsEventID` |
 | Publishers concorrentes | 3 publishers, 40 eventos: cada um publicado exatamente uma vez | `TestConcurrentPublishersPublishEachEventOnce` |
 | SNS indisponível | Backoff, `attempts` e `last_error` registrados; publica quando o prazo vence | `TestFailedPublicationIsRetriedWithBackoff` |
+| Falha no meio de uma carteira | Só a carteira afetada é adiada; os eventos seguintes dela não são enviados fora de ordem | `TestFailedPublicationPostponesOnlyItsPartition` |
+| Lote com várias carteiras | Publicação paralela entre carteiras e sequência de commit preservada dentro de cada uma | `TestPartitionsArePublishedConcurrentlyInOrder` |
 
 Nenhum evento é publicado antes do commit, porque o publisher só enxerga linhas já confirmadas da `outbox_events`.
+
+**Por que paralelizar por carteira**: o teste de carga mostrou a publicação sequencial (uma chamada ao SNS e um `UPDATE` por evento) como gargalo. Publicar grupos em paralelo multiplica a vazão sem abrir mão da ordem por carteira, que é a garantia oferecida aos consumidores (`MessageGroupId`). Números em [docs/LOAD_TEST.md](docs/LOAD_TEST.md).
 
 ### Contrato de roteamento e consumo dos eventos
 
@@ -869,6 +874,19 @@ Prometheus em `GET /metrics` no servidor administrativo (`ADMIN_ADDR`, separado 
 | `wallet_worker_errors_total` | counter | `worker` | falhas de iteração |
 | `go_*`, `process_*` | — | — | runtime |
 
+### Dashboard
+
+`deploy/grafana/dashboards/wallet-service.json` é provisionado automaticamente na pasta **Wallet** do Grafana (`http://localhost:3000`, acesso anônimo de leitura), com filtro por instância:
+
+| Seção | Painéis |
+|---|---|
+| Visão geral | instâncias ativas, requisições/s, 5xx/s, transações/s, eventos pendentes na outbox, divergências de reconciliação (vermelho acima de zero) |
+| HTTP | requisições por rota e status; latência p50/p95/p99 |
+| Processamento | transações por status, rejeições por `failureCode`, latência p95 por canal, replays, conflitos de idempotência, conflitos de concorrência e retries |
+| Mensageria | mensagens SQS por resultado, DLQ por motivo, publicações da outbox por resultado (incluindo `postponed`), pendentes, atraso e latência de publicação |
+| Pendências e reconciliação | resolução de referências por resultado, reconciliações, erros de workers |
+| Runtime | goroutines, memória residente e CPU por instância |
+
 O atraso da outbox é calculado no momento do scrape (`count` e `min(occurred_at)` dos não publicados, com timeout), então é o mesmo valor em qualquer instância e não depende de um publisher estar ativo. `wallet_outbox_backlog_scrape_success` indica falha na leitura.
 
 ### Tracing
@@ -925,11 +943,11 @@ Toda execução termina com a verificação de consistência financeira feita di
 - **Formatos equivalentes não são aceitos**: `25`, `25.0`, UUIDs em maiúsculas e identificadores com espaços são rejeitados em vez de normalizados, eliminando ambiguidade no hash de idempotência.
 - **Reversões parciais** não são suportadas (conforme o enunciado).
 - **Reversão única por transação**: um `ROLLBACK` de `REFUND` não reabre a `BET` para nova devolução.
-- **Custo das verificações adiadas**: os constraint triggers executam algumas leituras por linha alterada no commit. É um custo deliberado em troca de integridade garantida pelo banco; em volumes muito altos poderia ser substituído por reconciliação contínua.
+- **Custo das verificações adiadas**: os constraint triggers executam algumas leituras por linha alterada no commit. É um custo deliberado em troca de integridade garantida pelo banco, e toda leitura precisa usar índice com a carteira como primeira coluna: o teste de carga encontrou uma verificação que filtrava só por `transaction_id` e varria o ledger inteiro a cada commit (corrigida na migration `000007` e protegida por `TestIntegrityTriggersReadLedgerByIndexedLookups`). Em volumes muito altos as verificações poderiam ser substituídas por reconciliação contínua.
 - **Superusuário**: triggers protegem contra `UPDATE`/`DELETE`/`TRUNCATE` inclusive do dono do schema, mas um superusuário pode desabilitá-los (`session_replication_role`, `ALTER TABLE ... DISABLE TRIGGER`). Em produção o dono do schema não deve ser superusuário e o acesso administrativo deve ser auditado. No ambiente local o `POSTGRES_USER` do container é superusuário por conveniência.
 - **Tokens de provedor com roles de carteira** são tratados como provedor (menor privilégio). Revogação imediata de tokens não é suportada: a validação é local via JWKS, e a expiração curta limita a janela.
 - **Readiness não inclui o Keycloak**: o enunciado pede PostgreSQL e SQS. A indisponibilidade do IdP aparece como 503 nas requisições autenticadas.
 - **Aleatoriedade**: `math/rand/v2` é usado apenas para jitter de backoff; por isso a regra G404 do gosec está desabilitada. Identificadores usam UUIDv7 (`crypto/rand`).
 - **IAM no LocalStack**: identidades, políticas e políticas de recurso são provisionadas, mas não aplicadas pela edição community (ver [Credenciais e políticas do broker](#credenciais-e-políticas-do-broker)).
-- **Ordem de eventos após retry**: garantida por carteira apenas enquanto não há falhas de publicação; consumidores usam `walletVersion`.
+- **Ordem de eventos após retry**: dentro de um lote, uma falha adia os eventos seguintes da mesma carteira. Entre lotes de publishers diferentes, eventos de uma carteira podem ser reservados por instâncias distintas e, após falhas e leases expirados, chegar fora de ordem; consumidores devem usar `walletVersion`.
 - **Retenção da outbox**: eventos publicados podem ser apagados (o trigger só retém os não publicados), mas o job de retenção não faz parte do escopo.
